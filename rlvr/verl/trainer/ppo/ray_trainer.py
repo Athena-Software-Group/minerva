@@ -19,18 +19,21 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from functools import partial
 from pprint import pprint
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import ray
@@ -70,6 +73,30 @@ from verl.workers.reward_manager.naive import NaiveRewardManager
 
 ZERO_SOLVE_THRESH = 1e-3
 ALL_SOLVE_THRESH = 0.95
+_TEXTCNN_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+class _TextCNNModel(torch.nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int, kernel_sizes: list[int], num_filters: int):
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.convs = torch.nn.ModuleList(
+            [torch.nn.Conv1d(embed_dim, num_filters, kernel_size) for kernel_size in kernel_sizes]
+        )
+        self.dropout = torch.nn.Dropout(0.0)
+        self.fc = torch.nn.Linear(num_filters * len(kernel_sizes), 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        emb = self.embed(x)  # (batch, seq, dim)
+        emb = emb.transpose(1, 2)  # (batch, dim, seq)
+        feats = []
+        for conv in self.convs:
+            y = torch.relu(conv(emb))
+            y = torch.max(y, dim=2).values
+            feats.append(y)
+        out = torch.cat(feats, dim=1)
+        out = self.dropout(out)
+        return self.fc(out)
 
 
 @dataclass
@@ -142,6 +169,25 @@ class ResourcePoolManager:
                     f"Resource pool {resource_pool_name}: {num_gpus}*{num_nodes}"
                     + "cannot be satisfied in this ray cluster"
                 )
+
+
+class _RefJudgeRunner:
+    def __init__(self, ref_worker_group: RayWorkerGroup):
+        self._ref_worker_group = ref_worker_group
+
+    def generate(self, prompts: list[str], *, max_new_tokens: int, temperature: float, top_p: float, batch_size: int):
+        outputs = self._ref_worker_group.generate_judge_outputs(
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            batch_size=batch_size,
+        )
+        if isinstance(outputs, list) and outputs and isinstance(outputs[0], list):
+            return outputs[0]
+        if isinstance(outputs, list):
+            return outputs
+        return []
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -375,6 +421,8 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         self._init_distill_state()
         self._init_acr_state()
+        self._best_val_metric = None
+        self._best_val_step = None
 
     def _expanduser_in_config(self, cfg):
         """Recursively expand user home (~) in string paths within the config."""
@@ -680,7 +728,12 @@ class RayPPOTrainer:
         data_sources = np.concatenate(data_source_lst, axis=0)
         source_files = np.concatenate(source_file_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        infos_for_metrics = {
+            key: vals
+            for key, vals in reward_extra_infos_dict.items()
+            if key not in {"score", "ifeval_instruction_rate", "ifeval_instruction_count"}
+        }
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, infos_for_metrics)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -697,6 +750,12 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        for key in list(metric_dict.keys()):
+            if key.startswith("val-core/reward_instruction_following/") or key.startswith(
+                "val-aux/reward_instruction_following/"
+            ):
+                metric_dict.pop(key, None)
 
         # Aggregate reward per source_file when it spans multiple data sources
         if (
@@ -725,14 +784,18 @@ class RayPPOTrainer:
                         break
             if minerva_file is not None:
                 minerva_mean = file_means.get(minerva_file)
-                athena_means = [val for sf, val in file_means.items() if sf != minerva_file]
+                athena_means = [val for sf, val in file_means.items() if sf.startswith("athena-cti-")]
+                ifeval_mean = None
+                if data_sources is not None:
+                    ifeval_mask = data_sources == "reward_instruction_following"
+                    if ifeval_mask.any():
+                        ifeval_mean = float(rewards[ifeval_mask].mean())
+                        metric_dict["val-core/ifeval/reward/mean"] = ifeval_mean
                 if athena_means:
                     athena_mean = float(np.mean(athena_means))
                     metric_dict["val-core/athena-bench/reward/mean"] = athena_mean
                     if minerva_mean is not None:
-                        metric_dict["val-core/global-val/reward/mean"] = float(
-                            (minerva_mean + athena_mean) / 2.0
-                        )
+                        metric_dict["val-core/global-val/reward/mean"] = float((minerva_mean + athena_mean) / 2.0)
                 if minerva_mean is not None:
                     metric_dict["val-core/minerva-dev/reward/mean"] = float(minerva_mean)
                 if athena_means and minerva_mean is not None:
@@ -754,11 +817,15 @@ class RayPPOTrainer:
             ):
                 data_sources_arr = np.array([str(ds) for ds in data_sources])
                 athena_mask = np.array([ds.startswith("athena-cti-") for ds in data_sources_arr])
-                minerva_mask = ~athena_mask
+                ifeval_mask = data_sources_arr == "reward_instruction_following"
+                seceval_mask = np.array([ds in {"seceval", "seceval-mini"} for ds in data_sources_arr])
+                minerva_mask = (~athena_mask) & (~ifeval_mask) & (~seceval_mask)
                 if "val-core/minerva-dev/reward/mean" not in metric_dict and minerva_mask.any():
                     metric_dict["val-core/minerva-dev/reward/mean"] = float(rewards[minerva_mask].mean())
                 if "val-core/athena-bench/reward/mean" not in metric_dict and athena_mask.any():
                     metric_dict["val-core/athena-bench/reward/mean"] = float(rewards[athena_mask].mean())
+                if "val-core/ifeval/reward/mean" not in metric_dict and ifeval_mask.any():
+                    metric_dict["val-core/ifeval/reward/mean"] = float(rewards[ifeval_mask].mean())
             if "val-core/global-val/reward/mean" not in metric_dict:
                 minerva_mean = metric_dict.get("val-core/minerva-dev/reward/mean")
                 athena_mean = metric_dict.get("val-core/athena-bench/reward/mean")
@@ -897,6 +964,33 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
+        # create judge worker if requested (separate GPU-backed model)
+        if self._acr_judge_backend_requested == "worker":
+            judge_model = self._acr_judge_model
+            if not judge_model:
+                print("ACR judge backend 'worker' requested but judge_model is missing; using HF judge.")
+                self._acr_judge_backend_requested = None
+            else:
+                judge_cfg = OmegaConf.create(OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True))
+                with open_dict(judge_cfg):
+                    ref_cfg = judge_cfg.get("ref")
+                    if ref_cfg is None:
+                        judge_cfg["ref"] = {}
+                    ref_cfg = judge_cfg["ref"]
+                    if ref_cfg.get("model") is None:
+                        ref_cfg["model"] = {}
+                    ref_cfg["model"]["path"] = judge_model
+                judge_worker_cls = self.role_worker_mapping.get(Role.RefPolicy) or self.role_worker_mapping.get(
+                    Role.ActorRollout
+                )
+                if judge_worker_cls is None:
+                    print("ACR judge backend 'worker' unavailable; using HF judge.")
+                    self._acr_judge_backend_requested = None
+                else:
+                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                    judge_cls = RayClassWithInitArgs(judge_worker_cls, config=judge_cfg, role="ref")
+                    self.resource_pool_to_cls[resource_pool]["judge"] = judge_cls
+
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
@@ -952,6 +1046,13 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
+        if "judge" in all_wg:
+            self.judge_wg = all_wg["judge"]
+            self.judge_wg.init_model()
+
+        self._maybe_init_acr_judge_runner()
+        self._maybe_init_acr_ema_teacher()
+
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
@@ -963,13 +1064,78 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
-    def _save_checkpoint(self):
+    def _maybe_init_acr_judge_runner(self) -> None:
+        if not self._acr_enabled or not self._acr_judge_backend_requested:
+            return
+        if self._acr_judge_backend_requested not in {"ref", "worker"}:
+            return
+        judge_backend = self._acr_judge_backend_requested
+        if judge_backend == "ref":
+            if not self.use_reference_policy:
+                print("ACR judge backend 'ref' requested but reference policy is disabled; using HF judge.")
+                return
+            if not hasattr(self, "ref_policy_wg") or self.ref_policy_wg is None:
+                print("ACR judge backend 'ref' requested but ref worker is unavailable; using HF judge.")
+                return
+            if not hasattr(self.ref_policy_wg, "generate_judge_outputs"):
+                print("ACR judge backend 'ref' not supported by ref worker; using HF judge.")
+                return
+            judge_wg = self.ref_policy_wg
+        else:
+            if self.judge_wg is None:
+                print("ACR judge backend 'worker' requested but judge worker is unavailable; using HF judge.")
+                return
+            if not hasattr(self.judge_wg, "generate_judge_outputs"):
+                print("ACR judge backend 'worker' not supported by judge worker; using HF judge.")
+                return
+            judge_wg = self.judge_wg
+        try:
+            from verl.utils.reward_score.reward_acr_batch import reward_acr_batch
+        except Exception as exc:
+            print(f"ACR judge backend '{judge_backend}' unavailable: {exc}")
+            return
+
+        self._acr_judge_runner = _RefJudgeRunner(judge_wg)
+        reward_kwargs = dict(self._acr_reward_kwargs)
+        reward_kwargs["judge_backend"] = judge_backend
+        reward_kwargs["judge_runner"] = self._acr_judge_runner
+        self._acr_reward_fn.compute_score = partial(reward_acr_batch, **reward_kwargs)
+        self._acr_judge_backend_requested = None
+
+    def _maybe_init_acr_ema_teacher(self) -> None:
+        if not getattr(self, "_acr_ema_enabled", False):
+            return
+        if not hasattr(self, "actor_rollout_wg") or self.actor_rollout_wg is None:
+            return
+        try:
+            self.actor_rollout_wg.init_ema_teacher(self._acr_ema_alpha)
+        except Exception as exc:
+            print(f"ACR ema_teacher init failed: {exc}")
+            self._acr_ema_enabled = False
+
+    def _maybe_reset_acr_ema_teacher(self) -> None:
+        if not getattr(self, "_acr_ema_enabled", False):
+            return
+        if not hasattr(self, "actor_rollout_wg") or self.actor_rollout_wg is None:
+            return
+        try:
+            self.actor_rollout_wg.reset_ema_teacher()
+        except Exception as exc:
+            print(f"ACR ema_teacher reset failed: {exc}")
+
+    def _save_checkpoint(
+        self,
+        *,
+        folder_name: Optional[str] = None,
+        update_tracker: bool = True,
+        purge_dir: bool = False,
+        skip_ckpt_rotation: bool = False,
+    ):
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
+        folder_name = folder_name or f"global_step_{self.global_steps}"
+        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, folder_name)
 
         print(f"local_global_step_folder: {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
@@ -992,6 +1158,12 @@ class RayPPOTrainer:
         max_critic_ckpt_to_keep = (
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
+        if skip_ckpt_rotation:
+            max_actor_ckpt_to_keep = None
+            max_critic_ckpt_to_keep = None
+
+        if purge_dir and local_global_step_folder:
+            shutil.rmtree(local_global_step_folder, ignore_errors=True)
 
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
@@ -1014,12 +1186,17 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        step_marker_path = os.path.join(local_global_step_folder, "checkpoint_step.txt")
+        with open(step_marker_path, "w") as f:
             f.write(str(self.global_steps))
+
+        # latest checkpointed iteration tracker (for atomic usage)
+        if update_tracker:
+            local_latest_checkpointed_iteration = os.path.join(
+                self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+            )
+            with open(local_latest_checkpointed_iteration, "w") as f:
+                f.write(str(folder_name))
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1043,16 +1220,25 @@ class RayPPOTrainer:
         else:
             if self.config.trainer.resume_mode == "resume_path":
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
-                )
                 global_step_folder = self.config.trainer.resume_from_path
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        if "global_step_" in global_step_folder:
+            self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        else:
+            step_marker_path = os.path.join(global_step_folder, "checkpoint_step.txt")
+            if os.path.exists(step_marker_path):
+                with open(step_marker_path, "r") as f:
+                    try:
+                        self.global_steps = int(f.read().strip())
+                    except (TypeError, ValueError):
+                        self.global_steps = 0
+            else:
+                print(f"Warning: missing checkpoint_step.txt in {global_step_folder}, setting global_step=0")
+                self.global_steps = 0
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
@@ -1068,6 +1254,8 @@ class RayPPOTrainer:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        self._maybe_reset_acr_ema_teacher()
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -1242,27 +1430,105 @@ class RayPPOTrainer:
 
         if distill_cfg is None:
             distill_cfg = {}
+        dedup_by_uid_present = False
+        user_max_buffer = False
+        user_batch_size = False
+        user_buffer_mode = False
         if isinstance(distill_cfg, DictConfig):
+            dedup_by_uid_present = "dedup_by_uid" in distill_cfg
+            user_max_buffer = "max_buffer" in distill_cfg
+            user_batch_size = "batch_size" in distill_cfg
+            user_buffer_mode = "buffer_mode" in distill_cfg
             distill_cfg = OmegaConf.to_container(distill_cfg, resolve=True)
         if not isinstance(distill_cfg, dict):
             distill_cfg = {}
+        if isinstance(distill_cfg, dict) and "dedup_by_uid" in distill_cfg:
+            dedup_by_uid_present = True
+        if isinstance(distill_cfg, dict):
+            user_max_buffer = user_max_buffer or ("max_buffer" in distill_cfg)
+            user_batch_size = user_batch_size or ("batch_size" in distill_cfg)
+            user_buffer_mode = user_buffer_mode or ("buffer_mode" in distill_cfg)
 
         defaults = {
             "enabled": False,
             "interval": 10,
             "reward_threshold": 0.5,
             "max_buffer": 4096,
+            "min_buffer": 0,
             "batch_size": None,
             "max_seq_len": None,
             "entropy_tiebreak": "mean_nll",
+            "selection_mode": "top_reward",
+            "disable_filters": False,
+            "degenerate_filter": False,
+            "degenerate_min_tokens": 40,
+            "degenerate_rep_3_max": 0.85,
+            "degenerate_rep_4_max": 0.9,
+            "entropy_sampling": False,
+            "entropy_beta": 1.0,
+            "lr_scale": 1.0,
             "drop_last": True,
             "dedup_by_uid": True,
+            "buffer_mode": "rolling",
+            "filter_mode": "ml",
+            "filter_model": "textcnn-response-only-lr6e-4-k345-f384-e300-t1024-d0p25",
+            "filter_model_type": "textcnn",
+            "filter_threshold": 0.5,
+            "filter_batch_size": None,
+            "filter_max_length": 1024,
+            "filter_text_mode": "response",
+            "filter_device": "auto",
+            "filter_dtype": "auto",
+            "filter_tokenizer": None,
+            "filter_trust_remote_code": False,
         }
         if distill_source == "acr":
-            defaults["interval"] = 1
-            defaults["reward_threshold"] = 0.5
+            defaults["interval"] = 10
+            defaults["reward_threshold"] = 0.99
+            defaults["entropy_tiebreak"] = "mean_nll"
+            defaults["selection_mode"] = "random"
+            defaults["degenerate_filter"] = True
+            defaults["entropy_sampling"] = True
+            defaults["max_buffer"] = 1024
+            defaults["batch_size"] = 256
+            defaults["min_buffer"] = 256
         for key, value in defaults.items():
             distill_cfg.setdefault(key, value)
+
+        buffer_mode = str(distill_cfg.get("buffer_mode", "rolling")).lower().strip()
+        if buffer_mode not in {"rolling", "flush", "buffer"}:
+            buffer_mode = "rolling"
+        distill_cfg["buffer_mode"] = buffer_mode
+        if distill_source == "acr" and buffer_mode == "flush":
+            if not user_max_buffer:
+                distill_cfg["max_buffer"] = 0
+            if not user_batch_size:
+                distill_cfg["batch_size"] = 512
+
+        distill_method = str(distill_cfg.get("method", "sft")).lower().strip()
+        if distill_method not in {"sft", "dpo"}:
+            distill_method = "sft"
+        distill_cfg["method"] = distill_method
+
+        dpo_cfg = distill_cfg.get("dpo", {})
+        if not isinstance(dpo_cfg, dict):
+            dpo_cfg = {}
+        dpo_defaults = {
+            "beta": 0.1,
+            "require_rejected_parses": True,
+        }
+        for key, value in dpo_defaults.items():
+            dpo_cfg.setdefault(key, value)
+        distill_cfg["dpo"] = dpo_cfg
+
+        if distill_cfg.get("filter_batch_size") in (None, 0):
+            default_filter_bsz = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            if not default_filter_bsz:
+                default_filter_bsz = distill_cfg.get("batch_size") or 64
+            distill_cfg["filter_batch_size"] = int(default_filter_bsz)
+
+        if distill_method == "dpo" and distill_source == "acr" and not dedup_by_uid_present:
+            distill_cfg["dedup_by_uid"] = False
 
         self._distill_cfg = distill_cfg
         self._distill_source = distill_source
@@ -1282,11 +1548,30 @@ class RayPPOTrainer:
         self._acr_normalize_label = None
         self._acr_extract_labels_from_truth = None
         self._acr_task_spec_cls = None
+        self._acr_task_reasoning_hints = {}
+        self._acr_entity_reasoning_hints = {}
+        self._acr_update_actor = False
+        self._acr_judge_runner = None
+        self._acr_judge_backend_requested = None
+        self._acr_reward_kwargs = {}
+        self._acr_judge_model = None
+        self._acr_filter_state = None
+        self._acr_filter_disabled = False
+        self._acr_skip_task_keys: set[str] = set()
+        self.judge_wg = None
         self._acr_reward_fn_key = self.config.data.get("reward_fn_key", "data_source")
         self._acr_apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
         self._acr_truncation = self.config.data.get("truncation", "error")
         self._acr_debug_samples = max(0, int(os.getenv("ACRD_DEBUG_SAMPLES", "0")))
         self._acr_details_debug_samples = max(0, int(os.getenv("ACRD_DETAILS_DEBUG_SAMPLES", "2")))
+        self._acr_filter_debug_samples = max(0, int(os.getenv("ACRD_ML_DEBUG_SAMPLES", "0")))
+        self._acr_filter_debug_remaining = 0
+        self._acr_rollout_sampling: dict = {}
+        self._acr_defer_generation = False
+        self._acr_prompt_buffer_local = []
+        self._acr_ema_enabled = False
+        self._acr_ema_alpha = None
+        self._acr_ema_warned_async = False
 
         acr_cfg = self.config.data.get("acr", {}) if self.config is not None else {}
         if isinstance(acr_cfg, DictConfig):
@@ -1308,12 +1593,53 @@ class RayPPOTrainer:
         except Exception as exc:
             print(f"ACR per-batch disabled: {exc}")
             return
+        try:
+            from verl.utils.dataset.minerva_acr_dataset import (
+                DEFAULT_ENTITY_REASONING_HINTS,
+                DEFAULT_TASK_REASONING_HINTS,
+            )
+        except Exception:
+            DEFAULT_TASK_REASONING_HINTS = {}
+            DEFAULT_ENTITY_REASONING_HINTS = {}
 
+        def apply_reasoning_hints(defaults, override):
+            if not isinstance(defaults, dict):
+                defaults = {}
+            merged = dict(defaults)
+            if not isinstance(override, dict):
+                return merged
+            for key, value in override.items():
+                hint_key = str(key or "").strip()
+                if not hint_key:
+                    continue
+                if value is None:
+                    merged.pop(hint_key, None)
+                    continue
+                hint_text = str(value).strip()
+                if not hint_text:
+                    merged.pop(hint_key, None)
+                    continue
+                merged[hint_key] = hint_text
+            return merged
+
+        reward_manager_name = str(acr_cfg.get("reward_manager", "naive")).strip().lower()
         reward_kwargs = dict(acr_cfg.get("reward_kwargs", {}))
         reward_kwargs.setdefault("enforce_no_id_in_reasoning", bool(acr_cfg.get("enforce_no_id_in_reasoning", True)))
-
+        if reward_manager_name != "batch":
+            reward_kwargs = {k: v for k, v in reward_kwargs.items() if not str(k).startswith("judge_")}
+        else:
+            judge_backend = str(reward_kwargs.get("judge_backend", "hf")).strip().lower()
+            if judge_backend in {"ref", "worker"}:
+                self._acr_judge_backend_requested = judge_backend
+                reward_kwargs["judge_backend"] = "hf"
+                reward_kwargs.pop("judge_runner", None)
+                self._acr_judge_model = reward_kwargs.get("judge_model")
+        self._acr_reward_kwargs = dict(reward_kwargs)
         try:
-            from verl.utils.reward_score.reward_acr import reward_acr
+            if reward_manager_name == "batch":
+                from verl.utils.reward_score.reward_acr_batch import reward_acr_batch
+            else:
+                from verl.utils.reward_score.reward_acr import reward_acr
         except Exception as exc:
             print(f"ACR per-batch disabled: {exc}")
             return
@@ -1327,23 +1653,161 @@ class RayPPOTrainer:
         self._acr_normalize_label = normalize_label
         self._acr_extract_labels_from_truth = extract_labels_from_truth
         self._acr_task_spec_cls = RetrievalTaskSpec
+        self._acr_task_reasoning_hints = apply_reasoning_hints(
+            DEFAULT_TASK_REASONING_HINTS, acr_cfg.get("task_reasoning_hints")
+        )
+        self._acr_entity_reasoning_hints = apply_reasoning_hints(
+            DEFAULT_ENTITY_REASONING_HINTS, acr_cfg.get("entity_reasoning_hints")
+        )
 
         self._acr_cfg = acr_cfg
         self._acr_enabled = True
+        skip_task_keys = acr_cfg.get("skip_task_keys")
+        if skip_task_keys is None:
+            skip_task_keys = acr_cfg.get("skip_data_sources")
+        if isinstance(skip_task_keys, (list, tuple, set, ListConfig)):
+            skip_task_keys = list(skip_task_keys)
+        elif isinstance(skip_task_keys, str):
+            skip_task_keys = [item.strip() for item in skip_task_keys.split(",") if item.strip()]
+        else:
+            skip_task_keys = []
+        skip_set = {str(item).strip().lower() for item in skip_task_keys if str(item).strip()}
+        if bool(acr_cfg.get("skip_cvss", False)):
+            skip_set.update({"reward_cvss_v31", "reward_cvss_v40", "cve_to_cvss_v31", "cve_to_cvss_v40"})
+        self._acr_skip_task_keys = skip_set
         self._acr_max_details_chars = int(acr_cfg.get("max_details_chars", 4048))
         self._acr_enforce_no_id = bool(acr_cfg.get("enforce_no_id_in_reasoning", True))
         self._acr_max_prompt_length = int(
             acr_cfg.get("max_prompt_length", self.config.data.get("max_prompt_length", 1024))
         )
         self._acr_rollout_n = max(1, int(acr_cfg.get("rollout_n", 4)))
+        rollout_sampling = acr_cfg.get("rollout_sampling", {})
+        if isinstance(rollout_sampling, DictConfig):
+            rollout_sampling = OmegaConf.to_container(rollout_sampling, resolve=True)
+        if not isinstance(rollout_sampling, dict):
+            rollout_sampling = {}
+        cleaned_sampling = {}
+        for key, value in rollout_sampling.items():
+            key_str = str(key or "").strip()
+            if not key_str or value is None:
+                continue
+            cleaned_sampling[key_str] = value
+        self._acr_rollout_sampling = cleaned_sampling
         self._acr_weight = float(acr_cfg.get("rl_weight", 0.3))
-        compute_score = partial(reward_acr, **reward_kwargs)
-        self._acr_reward_fn = NaiveRewardManager(
-            tokenizer=self.tokenizer,
-            num_examine=0,
-            compute_score=compute_score,
-            reward_fn_key=self._acr_reward_fn_key,
-        )
+        self._acr_update_actor = bool(acr_cfg.get("update_actor", False))
+        defer_generation = bool(acr_cfg.get("defer_generation", False))
+        if defer_generation:
+            distill_method = str(self._distill_cfg.get("method", "sft")).lower().strip()
+            buffer_mode = str(self._distill_cfg.get("buffer_mode", "rolling")).lower().strip()
+            distill_enabled = bool(self._distill_cfg.get("enabled", False))
+            interval = int(self._distill_cfg.get("interval", 0) or 0)
+            if self._distill_source != "acr" or distill_method != "sft" or not distill_enabled:
+                print("ACR defer_generation disabled: requires ACR SFT distillation.")
+                defer_generation = False
+            elif buffer_mode == "buffer":
+                print("ACR defer_generation disabled: buffer_mode=buffer is not supported.")
+                defer_generation = False
+            elif interval <= 0:
+                print("ACR defer_generation disabled: distill interval must be > 0.")
+                defer_generation = False
+            elif self._acr_update_actor or bool(acr_cfg.get("update_critic", False)):
+                print("ACR defer_generation disabled: update_actor/update_critic enabled.")
+                defer_generation = False
+        self._acr_defer_generation = defer_generation
+
+        ema_cfg = acr_cfg.get("ema_teacher", {})
+        if isinstance(ema_cfg, DictConfig):
+            ema_cfg = OmegaConf.to_container(ema_cfg, resolve=True)
+        if isinstance(ema_cfg, dict):
+            ema_enabled = bool(ema_cfg.get("enabled", False))
+            if ema_enabled:
+                distill_method = str(self._distill_cfg.get("method", "sft")).lower().strip()
+                distill_enabled = bool(self._distill_cfg.get("enabled", False))
+                try:
+                    ema_alpha = float(ema_cfg.get("alpha", 0.995))
+                except (TypeError, ValueError):
+                    ema_alpha = 0.995
+                if ema_alpha <= 0.0 or ema_alpha >= 1.0:
+                    ema_alpha = 0.995
+                if self._distill_source != "acr" or distill_method != "sft" or not distill_enabled:
+                    print("ACR ema_teacher disabled: requires ACR SFT distillation.")
+                    ema_enabled = False
+                elif self._acr_update_actor or bool(acr_cfg.get("update_critic", False)):
+                    print("ACR ema_teacher disabled: update_actor/update_critic enabled.")
+                    ema_enabled = False
+                else:
+                    self._acr_ema_alpha = ema_alpha
+            if ema_enabled:
+                self._acr_ema_enabled = True
+
+        hard_reward_threshold = acr_cfg.get("hard_reward_threshold", None)
+        hard_reward_threshold_set = "hard_reward_threshold" in acr_cfg and hard_reward_threshold is not None
+        if hard_reward_threshold_set:
+            try:
+                self._acr_hard_reward_threshold = float(hard_reward_threshold)
+            except (TypeError, ValueError):
+                self._acr_hard_reward_threshold = None
+                hard_reward_threshold_set = False
+        else:
+            self._acr_hard_reward_threshold = None
+        self._acr_hard_reward_threshold_set = hard_reward_threshold_set
+
+        self._acr_hard_reward_no_perfect = False
+        hard_reward_mode = str(acr_cfg.get("hard_reward_mode", "no_perfect")).lower().strip()
+        if hard_reward_mode in {"mean", "avg", "average", "mean_reward"}:
+            hard_reward_mode = "mean"
+        elif hard_reward_mode in {"max", "max_reward"}:
+            hard_reward_mode = "max"
+        elif hard_reward_mode in {"no_perfect", "no_perfect_reward", "no_perfect_rollout"}:
+            hard_reward_mode = "max"
+            self._acr_hard_reward_no_perfect = True
+        else:
+            hard_reward_mode = "max"
+            self._acr_hard_reward_no_perfect = True
+        self._acr_hard_reward_mode = hard_reward_mode
+        if reward_manager_name == "batch":
+            from verl.workers.reward_manager.batch import BatchRewardManager
+
+            compute_score = partial(reward_acr_batch, **reward_kwargs)
+            self._acr_reward_fn = BatchRewardManager(
+                tokenizer=self.tokenizer,
+                num_examine=0,
+                compute_score=compute_score,
+                reward_fn_key=self._acr_reward_fn_key,
+            )
+        else:
+            compute_score = partial(reward_acr, **reward_kwargs)
+            self._acr_reward_fn = NaiveRewardManager(
+                tokenizer=self.tokenizer,
+                num_examine=0,
+                compute_score=compute_score,
+                reward_fn_key=self._acr_reward_fn_key,
+            )
+
+    def _acr_should_skip_task(self, data_source: Any, extra_info: Any = None) -> bool:
+        skip_keys = getattr(self, "_acr_skip_task_keys", None)
+        if not skip_keys:
+            return False
+
+        def _match(value: Any) -> bool:
+            if value is None:
+                return False
+            text = str(value).strip().lower()
+            return bool(text) and text in skip_keys
+
+        if _match(data_source):
+            return True
+        if isinstance(extra_info, dict):
+            if _match(extra_info.get("task")):
+                return True
+            if _match(extra_info.get("acr_task_key")):
+                return True
+            source_file = extra_info.get("source_file")
+            if source_file:
+                stem = os.path.splitext(os.path.basename(str(source_file)))[0]
+                if _match(stem):
+                    return True
+        return False
 
     def _debug_log_acr_samples(
         self,
@@ -1398,6 +1862,11 @@ class RayPPOTrainer:
             base_scores = [None] * len(reward_list)
 
         leak_hits = reward_extra_infos.get("acr_leak_hit")
+        extracted = reward_extra_infos.get("acr_extracted")
+        if isinstance(extracted, np.ndarray):
+            extracted = extracted.tolist()
+        if not isinstance(extracted, list) or len(extracted) != len(reward_list):
+            extracted = [None] * len(reward_list)
         if isinstance(leak_hits, np.ndarray):
             leak_hits = leak_hits.tolist()
         if not isinstance(leak_hits, list) or len(leak_hits) != len(reward_list):
@@ -1407,6 +1876,87 @@ class RayPPOTrainer:
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        response_ids_cache: dict[int, list[int]] = {}
+        response_text_cache: dict[int, str] = {}
+        response_text_cache: dict[int, str] = {}
+        response_text_cache: dict[int, str] = {}
+        response_text_cache: dict[int, str] = {}
+        response_text_cache: dict[int, str] = {}
+
+        def extract_response_ids(idx: int) -> list[int]:
+            cached = response_ids_cache.get(idx)
+            if cached is not None:
+                return cached
+            if response_mask is not None:
+                valid_len = int(response_mask[idx].sum().item())
+                response_ids = responses[idx][:valid_len].tolist()
+            else:
+                response_ids = responses[idx].tolist()
+                while response_ids and response_ids[-1] == pad_id:
+                    response_ids.pop()
+            response_ids_cache[idx] = response_ids
+            return response_ids
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
 
         def render_messages(messages: Optional[list]) -> str:
             if not isinstance(messages, list):
@@ -1434,10 +1984,163 @@ class RayPPOTrainer:
                 return None
             return float(-(log_probs[idx] * mask).sum().item() / denom.item())
 
+        def response_len(idx: int) -> int:
+            if response_mask is not None:
+                return int(response_mask[idx].sum().item())
+            resp = responses[idx]
+            if resp.numel() == 0:
+                return 0
+            if pad_id is None:
+                return int(resp.numel())
+            non_pad = (resp != pad_id).nonzero(as_tuple=False)
+            if non_pad.numel() == 0:
+                return 0
+            return int(non_pad[-1].item() + 1)
+
+        def response_len(idx: int) -> int:
+            if response_mask is not None:
+                return int(response_mask[idx].sum().item())
+            resp = responses[idx]
+            if resp.numel() == 0:
+                return 0
+            if pad_id is None:
+                return int(resp.numel())
+            non_pad = (resp != pad_id).nonzero(as_tuple=False)
+            if non_pad.numel() == 0:
+                return 0
+            return int(non_pad[-1].item() + 1)
+
+        degenerate_filter = bool(self._distill_cfg.get("degenerate_filter", False))
+        disable_filters = bool(self._distill_cfg.get("disable_filters", False))
+        if self._distill_source == "acr" and disable_filters:
+            degenerate_filter = False
+        degenerate_min_tokens = int(self._distill_cfg.get("degenerate_min_tokens", 0) or 0)
+        try:
+            degenerate_rep_3_max = float(self._distill_cfg.get("degenerate_rep_3_max", 1.0))
+        except (TypeError, ValueError):
+            degenerate_rep_3_max = 1.0
+        try:
+            degenerate_rep_4_max = float(self._distill_cfg.get("degenerate_rep_4_max", 1.0))
+        except (TypeError, ValueError):
+            degenerate_rep_4_max = 1.0
+        degenerate_rep_3_max = min(max(degenerate_rep_3_max, 0.0), 1.0)
+        degenerate_rep_4_max = min(max(degenerate_rep_4_max, 0.0), 1.0)
+        degenerate_window_size = int(self._distill_cfg.get("degenerate_window_size", 24) or 0)
+        degenerate_window_stride = int(
+            self._distill_cfg.get("degenerate_window_stride", max(1, degenerate_window_size // 2)) or 1
+        )
+        try:
+            degenerate_window_jaccard = float(self._distill_cfg.get("degenerate_window_jaccard", 0.9))
+        except (TypeError, ValueError):
+            degenerate_window_jaccard = 0.9
+        try:
+            degenerate_sentence_sim = float(self._distill_cfg.get("degenerate_sentence_sim", 0.75))
+        except (TypeError, ValueError):
+            degenerate_sentence_sim = 0.9
+        degenerate_sentence_window = int(self._distill_cfg.get("degenerate_sentence_window", 6) or 0)
+        degenerate_sentence_min_words = int(self._distill_cfg.get("degenerate_sentence_min_words", 6) or 0)
+        degenerate_window_jaccard = min(max(degenerate_window_jaccard, 0.0), 1.0)
+        degenerate_sentence_sim = min(max(degenerate_sentence_sim, 0.0), 1.0)
+
+        def distinct_ngram_ratio(tokens: list[int], n: int) -> float:
+            total = len(tokens) - n + 1
+            if total <= 0:
+                return 1.0
+            ngrams = {tuple(tokens[i : i + n]) for i in range(total)}
+            return len(ngrams) / total
+
+        def has_repeated_window(tokens: list[int]) -> bool:
+            if degenerate_window_size <= 0 or len(tokens) < degenerate_window_size * 2:
+                return False
+            stride = max(1, degenerate_window_stride)
+            windows: list[tuple[int, set[tuple[int, int, int]]]] = []
+            seen_exact: set[tuple[int, ...]] = set()
+            max_start = len(tokens) - degenerate_window_size
+            for start in range(0, max_start + 1, stride):
+                window = tokens[start : start + degenerate_window_size]
+                window_key = tuple(window)
+                if window_key in seen_exact:
+                    return True
+                seen_exact.add(window_key)
+                if len(window) < 3:
+                    continue
+                ngrams = {tuple(window[i : i + 3]) for i in range(len(window) - 2)}
+                windows.append((start, ngrams))
+            for i in range(len(windows)):
+                start_i, grams_i = windows[i]
+                for j in range(i + 1, len(windows)):
+                    start_j, grams_j = windows[j]
+                    if abs(start_i - start_j) < degenerate_window_size:
+                        continue
+                    union = grams_i | grams_j
+                    if not union:
+                        continue
+                    jaccard = len(grams_i & grams_j) / len(union)
+                    if jaccard >= degenerate_window_jaccard:
+                        return True
+            return False
+
+        def sentence_near_duplicate(text: str) -> bool:
+            if not text or degenerate_sentence_sim <= 0.0:
+                return False
+            raw_parts = re.split(r"[.!?]+|\\n+", text)
+            sentences = []
+            for part in raw_parts:
+                cleaned = re.sub(r"[^a-z0-9\\s]", "", part.lower())
+                cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+                if not cleaned:
+                    continue
+                if degenerate_sentence_min_words and len(cleaned.split()) < degenerate_sentence_min_words:
+                    continue
+                sentences.append(cleaned)
+            if len(sentences) < 2:
+                return False
+            window = max(1, degenerate_sentence_window)
+            for i in range(len(sentences)):
+                left = sentences[i]
+                for j in range(i + 1, min(len(sentences), i + 1 + window)):
+                    if SequenceMatcher(None, left, sentences[j]).ratio() >= degenerate_sentence_sim:
+                        return True
+            return False
+
+        def is_degenerate(tokens: list[int], idx: Optional[int] = None) -> bool:
+            if not degenerate_filter or len(tokens) < degenerate_min_tokens:
+                return False
+            rep_3 = 1.0 - distinct_ngram_ratio(tokens, 3)
+            rep_4 = 1.0 - distinct_ngram_ratio(tokens, 4)
+            if rep_3 >= degenerate_rep_3_max or rep_4 >= degenerate_rep_4_max:
+                return True
+            if has_repeated_window(tokens):
+                return True
+            if idx is not None:
+                response_text = extract_response_text(idx)
+                if sentence_near_duplicate(response_text):
+                    return True
+            return False
+
         grouped: dict[str, list[int]] = {}
+        skipped_task = 0
         for idx, uid in enumerate(uid_list):
+            if self._acr_should_skip_task(data_source_list[idx], extra_list[idx]):
+                skipped_task += 1
+                continue
             grouped.setdefault(str(uid), []).append(idx)
 
+        tiebreak_mode = str(self._distill_cfg.get("entropy_tiebreak", "mean_nll"))
+        selection_mode = str(self._distill_cfg.get("selection_mode", "random")).lower().strip()
+        if selection_mode in {"max_reward", "top_reward", "best", "reward"}:
+            selection_mode = "top_reward"
+        elif selection_mode in {"random", "rand", "uniform"}:
+            selection_mode = "random"
+        else:
+            selection_mode = "random"
+        entropy_sampling = bool(self._distill_cfg.get("entropy_sampling", False))
+        entropy_beta = self._distill_cfg.get("entropy_beta", 1.0)
+        try:
+            entropy_beta = float(entropy_beta)
+        except (TypeError, ValueError):
+            entropy_beta = 1.0
+        rng = np.random.default_rng()
         shown = 0
         for uid, idxs in grouped.items():
             if shown >= max_samples:
@@ -1452,20 +2155,75 @@ class RayPPOTrainer:
             orig_prompt = render_messages(extra_info.get("acr_orig_prompt"))
             acr_prompt = render_messages(extra_info.get("acr_prompt"))
 
-            eligible = [i for i in idxs if reward_threshold_list[i] >= threshold]
+            if self._distill_source == "acr":
+                eligible = []
+                for i in idxs:
+                    base_val = reward_threshold_list[i]
+                    if base_scores[i] is not None:
+                        base_val = base_scores[i]
+                    if base_val is None or base_val < threshold:
+                        continue
+                    if not disable_filters:
+                        if leak_hits[i] is not None and bool(leak_hits[i]):
+                            continue
+                        if degenerate_filter:
+                            response_ids = extract_response_ids(i)
+                            if not response_ids or is_degenerate(response_ids, idx=i):
+                                continue
+                    eligible.append(i)
+            else:
+                eligible = [i for i in idxs if reward_threshold_list[i] >= threshold]
             chosen_idx = None
-            entropy_proxy = None
+            tiebreak_proxy = None
             if eligible:
-                max_reward = max(reward_list[i] for i in eligible)
-                top = [i for i in eligible if reward_list[i] >= (max_reward - 1e-6)]
-                top.sort()
-                chosen_idx = top[0]
-                if len(top) > 1:
-                    entropy_map = {i: mean_nll(i) for i in top}
-                    chosen_idx = max(top, key=lambda i: (entropy_map.get(i, float("-inf")), -i))
-                    entropy_proxy = entropy_map.get(chosen_idx)
+                if selection_mode == "random":
+                    chosen_idx = int(rng.choice(eligible))
+                    if tiebreak_mode in {"response_len", "length"}:
+                        tiebreak_proxy = response_len(chosen_idx)
+                    else:
+                        tiebreak_proxy = mean_nll(chosen_idx)
                 else:
-                    entropy_proxy = mean_nll(chosen_idx)
+                    max_reward = max(reward_list[i] for i in eligible)
+                    top = [i for i in eligible if reward_list[i] >= (max_reward - 1e-6)]
+                    top.sort()
+                    chosen_idx = top[0]
+                    if len(top) > 1:
+                        if tiebreak_mode in {"response_len", "length"}:
+                            length_map = {i: response_len(i) for i in top}
+                            chosen_idx = max(top, key=lambda i: (length_map.get(i, -1), -i))
+                            tiebreak_proxy = length_map.get(chosen_idx)
+                        else:
+                            entropy_map = {i: mean_nll(i) for i in top}
+                            valid = [(i, val) for i, val in entropy_map.items() if val is not None]
+                            if not valid:
+                                chosen_idx = top[0]
+                                tiebreak_proxy = entropy_map.get(chosen_idx)
+                            elif entropy_sampling:
+                                idxs_only = [item[0] for item in valid]
+                                vals = np.array([item[1] for item in valid], dtype=np.float64)
+                                if not np.isfinite(vals).all():
+                                    vals = np.nan_to_num(vals, nan=-1e6, posinf=1e6, neginf=-1e6)
+                                vals = vals * entropy_beta
+                                vals = vals - np.max(vals)
+                                weights = np.exp(vals)
+                                total = float(weights.sum())
+                                if total <= 0 or not np.isfinite(total):
+                                    probs = np.ones_like(weights) / max(1, len(weights))
+                                else:
+                                    probs = weights / total
+                                chosen_idx = int(rng.choice(idxs_only, p=probs))
+                                tiebreak_proxy = entropy_map.get(chosen_idx)
+                            else:
+                                chosen_idx = max(
+                                    [item[0] for item in valid],
+                                    key=lambda i: (entropy_map.get(i, float("-inf")), -i),
+                                )
+                                tiebreak_proxy = entropy_map.get(chosen_idx)
+                    else:
+                        if tiebreak_mode in {"response_len", "length"}:
+                            tiebreak_proxy = response_len(chosen_idx)
+                        else:
+                            tiebreak_proxy = mean_nll(chosen_idx)
 
             print(f"\n[ACRD DEBUG] uid={uid} data_source={data_source} eligible={len(eligible)}/{len(idxs)}")
             if orig_prompt:
@@ -1474,37 +2232,49 @@ class RayPPOTrainer:
                 print("[ACRD DEBUG] modified prompt:\n" + truncate_text(acr_prompt))
 
             for j, idx in enumerate(idxs, start=1):
-                if response_mask is not None:
-                    valid_len = int(response_mask[idx].sum().item())
-                    response_ids = responses[idx][:valid_len].tolist()
-                else:
-                    response_ids = responses[idx].tolist()
-                    while response_ids and response_ids[-1] == pad_id:
-                        response_ids.pop()
+                response_ids = extract_response_ids(idx)
                 response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True) if response_ids else ""
                 reward_val = reward_list[idx]
                 base_score_val = base_scores[idx]
                 leak_hit_val = leak_hits[idx]
-                is_eligible = reward_threshold_list[idx] >= threshold
+                if self._distill_source == "acr":
+                    base_val = reward_threshold_list[idx]
+                    if base_scores[idx] is not None:
+                        base_val = base_scores[idx]
+                    is_eligible = (
+                        base_val is not None
+                        and base_val >= threshold
+                        and (leak_hits[idx] is None or not bool(leak_hits[idx]))
+                    )
+                else:
+                    is_eligible = reward_threshold_list[idx] >= threshold
                 base_str = f"{float(base_score_val):.3f}" if base_score_val is not None else "NA"
                 leak_str = "NA" if leak_hit_val is None else str(bool(leak_hit_val))
+                extracted_val = extracted[idx] if extracted[idx] is not None else None
+                extracted_str = "NA" if extracted_val is None else str(bool(extracted_val))
+                degenerate_str = "NA"
+                if degenerate_filter and response_ids:
+                    degenerate_str = str(is_degenerate(response_ids, idx=idx))
                 print(
                     "[ACRD DEBUG] response "
-                    f"{j}/{len(idxs)} reward={reward_val:.3f} base={base_str} eligible={is_eligible} leak={leak_str}\n"
+                    f"{j}/{len(idxs)} reward={reward_val:.3f} base={base_str} eligible={is_eligible} "
+                    f"extracted={extracted_str} leak={leak_str} degenerate={degenerate_str}\n"
                     + truncate_text(response_text)
                 )
 
             if chosen_idx is not None:
-                if response_mask is not None:
-                    valid_len = int(response_mask[chosen_idx].sum().item())
-                    chosen_ids = responses[chosen_idx][:valid_len].tolist()
-                else:
-                    chosen_ids = responses[chosen_idx].tolist()
-                    while chosen_ids and chosen_ids[-1] == pad_id:
-                        chosen_ids.pop()
+                chosen_ids = extract_response_ids(chosen_idx)
                 chosen_text = self.tokenizer.decode(chosen_ids, skip_special_tokens=True) if chosen_ids else ""
-                proxy_str = f"{entropy_proxy:.3f}" if entropy_proxy is not None else "NA"
-                print("[ACRD DEBUG] selected response (entropy_proxy=" + proxy_str + "):\n" + truncate_text(chosen_text))
+                if selection_mode == "random":
+                    label = "random"
+                elif tiebreak_mode in {"response_len", "length"}:
+                    label = "response_len"
+                else:
+                    label = "entropy_proxy"
+                    if entropy_sampling:
+                        label = "entropy_sample"
+                proxy_str = f"{tiebreak_proxy:.3f}" if tiebreak_proxy is not None else "NA"
+                print("[ACRD DEBUG] selected response (" + label + "=" + proxy_str + "):\n" + truncate_text(chosen_text))
             else:
                 print(f"[ACRD DEBUG] selected response: none (no response >= {threshold:.2f})")
             shown += 1
@@ -1604,6 +2374,7 @@ class RayPPOTrainer:
         skipped_missing_labels = 0
         skipped_prompt_too_long = 0
         skipped_tokenize_error = 0
+        skipped_task = 0
         details_missing = 0
         details_omitted = 0
         details_truncated = 0
@@ -1667,8 +2438,20 @@ class RayPPOTrainer:
             ground_truth = reward_model.get("ground_truth")
             data_source = data_sources[idx]
 
+            if self._acr_should_skip_task(data_source, extra_info):
+                skipped_task += 1
+                continue
+
             spec = self._acr_get_task_spec(data_source, ground_truth, extra_info)
             entity_type = spec.entity_type
+            reasoning_hint = None
+            task_hints = getattr(self, "_acr_task_reasoning_hints", None)
+            if spec.task_key and isinstance(task_hints, dict):
+                reasoning_hint = task_hints.get(spec.task_key)
+            if not reasoning_hint:
+                entity_hints = getattr(self, "_acr_entity_reasoning_hints", None)
+                if entity_type and isinstance(entity_hints, dict):
+                    reasoning_hint = entity_hints.get(entity_type)
             gold_norm = []
             if self._acr_extract_labels_from_truth is not None and self._acr_task_spec_cls is not None:
                 try:
@@ -1728,6 +2511,7 @@ class RayPPOTrainer:
                 max_details_chars=self._acr_max_details_chars,
                 prompt_too_long=self._acr_prompt_too_long,
                 enforce_no_id=self._acr_enforce_no_id,
+                reasoning_hint=reasoning_hint,
             )
             if skipped:
                 skipped_prompt_too_long += 1
@@ -1800,6 +2584,8 @@ class RayPPOTrainer:
             metrics["acr/skip_prompt_long"] = float(skipped_prompt_too_long)
         if skipped_tokenize_error:
             metrics["acr/skip_tokenize_error"] = float(skipped_tokenize_error)
+        if skipped_task:
+            metrics["acr/skip_task"] = float(skipped_task)
         if details_missing:
             metrics["acr/details_missing"] = float(details_missing)
         if details_omitted:
@@ -1824,6 +2610,171 @@ class RayPPOTrainer:
         non_tensors = {key: np.array(vals, dtype=object) for key, vals in non_tensor_lists.items()}
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors), metrics
 
+    def _compute_acr_hard_uids(
+        self, batch: DataProto, reward_scalar: Optional[torch.Tensor]
+    ) -> tuple[Optional[set[str]], dict[str, float]]:
+        metrics: dict[str, float] = {}
+        if not self._acr_enabled or reward_scalar is None:
+            return None, metrics
+
+        uid_arr = batch.non_tensor_batch.get("uid")
+        if uid_arr is None:
+            return None, metrics
+
+        uid_list = np.asarray(uid_arr, dtype=object).tolist()
+        reward_list = reward_scalar.detach().cpu().tolist()
+        if len(uid_list) != len(reward_list):
+            return None, metrics
+
+        reward_sum_by_uid: dict[str, float] = {}
+        reward_count_by_uid: dict[str, int] = {}
+        reward_max_by_uid: dict[str, float] = {}
+        for uid, reward in zip(uid_list, reward_list):
+            key = str(uid)
+            reward_val = float(reward)
+            reward_sum_by_uid[key] = reward_sum_by_uid.get(key, 0.0) + reward_val
+            reward_count_by_uid[key] = reward_count_by_uid.get(key, 0) + 1
+            prev = reward_max_by_uid.get(key)
+            if prev is None or reward_val > prev:
+                reward_max_by_uid[key] = reward_val
+
+        hard_mode = str(getattr(self, "_acr_hard_reward_mode", "max")).lower().strip()
+        if hard_mode in {"mean", "avg", "average", "mean_reward"}:
+            hard_mode = "mean"
+        elif hard_mode in {"max", "max_reward", "no_perfect", "no_perfect_reward", "no_perfect_rollout"}:
+            hard_mode = "max"
+        else:
+            hard_mode = "max"
+
+        if hard_mode == "mean":
+            mean_reward_by_uid = {
+                uid: (reward_sum_by_uid[uid] / max(1, reward_count_by_uid.get(uid, 0)))
+                for uid in reward_sum_by_uid
+            }
+            total = len(mean_reward_by_uid)
+            if getattr(self, "_acr_hard_reward_threshold_set", False):
+                threshold = float(getattr(self, "_acr_hard_reward_threshold", 0.5))
+            else:
+                threshold = 0.5
+            hard_uids = {uid for uid, score in mean_reward_by_uid.items() if score < threshold}
+        else:
+            total = len(reward_max_by_uid)
+            if getattr(self, "_acr_hard_reward_no_perfect", False):
+                threshold = 1.0
+            elif getattr(self, "_acr_hard_reward_threshold_set", False):
+                threshold = float(getattr(self, "_acr_hard_reward_threshold", 1.0))
+            else:
+                threshold = 1.0
+            hard_uids = {uid for uid, score in reward_max_by_uid.items() if score < (threshold - 1e-6)}
+
+        if total > 0:
+            metrics["acr/hard_uid_total"] = float(total)
+            metrics["acr/hard_uid_count"] = float(len(hard_uids))
+            metrics["acr/hard_uid_frac"] = float(len(hard_uids) / total)
+
+        return hard_uids, metrics
+
+    def _compute_uid_max_rewards(
+        self, batch: DataProto, reward_scalar: Optional[torch.Tensor]
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        metrics: dict[str, float] = {}
+        if reward_scalar is None:
+            return {}, metrics
+
+        uid_arr = batch.non_tensor_batch.get("uid")
+        if uid_arr is None:
+            return {}, metrics
+
+        uid_list = np.asarray(uid_arr, dtype=object).tolist()
+        reward_list = reward_scalar.detach().cpu().tolist()
+        if len(uid_list) != len(reward_list):
+            return {}, metrics
+
+        max_reward_by_uid: dict[str, float] = {}
+        for uid, reward in zip(uid_list, reward_list):
+            key = str(uid)
+            reward_val = float(reward)
+            prev = max_reward_by_uid.get(key)
+            if prev is None or reward_val > prev:
+                max_reward_by_uid[key] = reward_val
+
+        if max_reward_by_uid:
+            metrics["acr/uid_max_reward_mean"] = float(np.mean(list(max_reward_by_uid.values())))
+        return max_reward_by_uid, metrics
+
+    def _filter_acr_batch_by_uid_max_reward(
+        self, acr_batch: Optional[DataProto], uid_max_rewards: Optional[dict[str, float]]
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        metrics: dict[str, float] = {}
+        if acr_batch is None or len(acr_batch) == 0:
+            return acr_batch, metrics
+
+        if not uid_max_rewards:
+            metrics["acr/dpo_prompt_uid_used"] = 0.0
+            metrics["acr/dpo_prompt_uid_filtered"] = float(len(acr_batch))
+            return None, metrics
+
+        uid_arr = acr_batch.non_tensor_batch.get("uid")
+        if uid_arr is None:
+            return acr_batch, metrics
+
+        uid_list = np.asarray(uid_arr, dtype=object).tolist()
+        target_uids = {uid for uid, score in uid_max_rewards.items() if score < 1.0 - 1e-6}
+        total = len(uid_list)
+
+        if not target_uids:
+            metrics["acr/dpo_prompt_uid_used"] = 0.0
+            metrics["acr/dpo_prompt_uid_filtered"] = float(total)
+            return None, metrics
+
+        mask = np.array([str(uid) in target_uids for uid in uid_list], dtype=bool)
+        used = int(mask.sum())
+        metrics["acr/dpo_prompt_uid_used"] = float(used)
+        metrics["acr/dpo_prompt_uid_filtered"] = float(total - used)
+        metrics["acr/dpo_prompt_uid_used_frac"] = float(used / max(1, total))
+
+        if used == 0:
+            return None, metrics
+        if used < total:
+            acr_batch = acr_batch.select_idxs(mask)
+
+        return acr_batch, metrics
+
+    def _filter_acr_batch_by_uids(
+        self, acr_batch: Optional[DataProto], hard_uids: Optional[set[str]]
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        metrics: dict[str, float] = {}
+        if acr_batch is None or len(acr_batch) == 0:
+            return acr_batch, metrics
+
+        if hard_uids is None:
+            return acr_batch, metrics
+
+        uid_arr = acr_batch.non_tensor_batch.get("uid")
+        if uid_arr is None:
+            return acr_batch, metrics
+
+        uid_list = np.asarray(uid_arr, dtype=object).tolist()
+        total = len(uid_list)
+        if not hard_uids:
+            metrics["acr/hard_uid_used"] = 0.0
+            metrics["acr/hard_uid_used_frac"] = 0.0
+            metrics["acr/hard_uid_filtered"] = float(total)
+            return None, metrics
+
+        mask = np.array([str(uid) in hard_uids for uid in uid_list], dtype=bool)
+        used = int(mask.sum())
+        metrics["acr/hard_uid_used"] = float(used)
+        metrics["acr/hard_uid_used_frac"] = float(used / max(1, len(hard_uids)))
+        metrics["acr/hard_uid_filtered"] = float(total - used)
+
+        if used == 0:
+            return None, metrics
+        if used < total:
+            acr_batch = acr_batch.select_idxs(mask)
+
+        return acr_batch, metrics
+
     def _tokenize_prompt_nohint(self, messages: list[dict]) -> Optional[list[int]]:
         if not isinstance(messages, list):
             return None
@@ -1836,13 +2787,361 @@ class RayPPOTrainer:
         except Exception:
             return None
 
+    def _acr_filter_mode(self, disable_filters: bool) -> str:
+        mode = str(self._distill_cfg.get("filter_mode", "heuristic")).lower().strip()
+        compact = mode.replace(" ", "")
+        if compact in {"ml+heuristic", "ml+heuristics", "ml_heuristic", "ml_heuristics", "ml&heuristic", "both"}:
+            mode = "ml+heuristic"
+        if mode not in {"off", "heuristic", "ml", "ml+heuristic"}:
+            mode = "heuristic"
+        if mode == "heuristic" and disable_filters:
+            mode = "off"
+        return mode
+
+    def _render_prompt_payload(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload
+        if not isinstance(payload, list):
+            return ""
+        for msg in reversed(payload):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").lower()
+            content = msg.get("content")
+            if role == "user" and isinstance(content, str):
+                return content
+        contents = []
+        for msg in payload:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                contents.append(content)
+        return "\n".join(contents).strip()
+
+    def _extract_prompt_text(self, extra_info: Any) -> str:
+        if not isinstance(extra_info, dict):
+            return ""
+        for key in ("acr_orig_prompt", "orig_prompt", "raw_prompt", "prompt"):
+            payload = extra_info.get(key)
+            text = self._render_prompt_payload(payload)
+            if text:
+                return text
+        return ""
+
+    def _maybe_init_acr_filter_model(self) -> None:
+        if self._acr_filter_state is not None or self._acr_filter_disabled:
+            return
+        cfg = self._distill_cfg
+        model_name = cfg.get("filter_model")
+        if not model_name:
+            print("ACR distill ML filter requested but filter_model is not set; disabling filter.")
+            self._acr_filter_disabled = True
+            return
+        model_type = str(cfg.get("filter_model_type", "auto")).lower().strip()
+        if model_type == "modernbert":
+            model_type = "hf"
+        if model_type not in {"auto", "hf", "textcnn"}:
+            model_type = "auto"
+        if model_type == "auto":
+            model_type = "textcnn" if "textcnn" in str(model_name).lower() else "hf"
+
+        device_cfg = str(cfg.get("filter_device", "auto")).lower().strip()
+        if device_cfg == "auto":
+            device_cfg = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device_cfg)
+        batch_size = int(cfg.get("filter_batch_size") or 64)
+
+        try:
+            if model_type == "textcnn":
+                state = self._load_textcnn_filter_model(model_name, device, cfg)
+            else:
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+                tokenizer_name = cfg.get("filter_tokenizer") or model_name
+                trust_remote_code = bool(cfg.get("filter_trust_remote_code", False))
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=trust_remote_code)
+                if tokenizer.pad_token_id is None:
+                    tokenizer.pad_token_id = tokenizer.eos_token_id
+                max_length = int(cfg.get("filter_max_length") or 0)
+                if max_length <= 0:
+                    max_length = int(getattr(tokenizer, "model_max_length", 2048) or 2048)
+                tokenizer_max = getattr(tokenizer, "model_max_length", None)
+                if tokenizer_max and isinstance(tokenizer_max, int) and tokenizer_max > 0 and tokenizer_max < max_length:
+                    max_length = tokenizer_max
+
+                dtype_name = str(cfg.get("filter_dtype", "auto")).lower().strip()
+                torch_dtype = None
+                if dtype_name and dtype_name != "auto":
+                    if dtype_name in {"bf16", "bfloat16"}:
+                        torch_dtype = torch.bfloat16
+                    elif dtype_name in {"fp16", "float16"}:
+                        torch_dtype = torch.float16
+                    else:
+                        torch_dtype = getattr(torch, dtype_name, None)
+                model_kwargs = {"trust_remote_code": trust_remote_code}
+                if torch_dtype is not None:
+                    model_kwargs["torch_dtype"] = torch_dtype
+                model = AutoModelForSequenceClassification.from_pretrained(model_name, **model_kwargs)
+                model.eval()
+                if device.type != "cpu":
+                    model.to(device)
+
+                good_id = 1
+                label2id = getattr(model.config, "label2id", {}) or {}
+                for label, idx in label2id.items():
+                    if str(label).upper() == "GOOD":
+                        good_id = int(idx)
+                        break
+                state = {
+                    "type": "hf",
+                    "model": model,
+                    "tokenizer": tokenizer,
+                    "device": device,
+                    "max_length": max_length,
+                    "good_id": good_id,
+                }
+        except Exception as exc:
+            print(f"ACR filter model init failed: {exc}")
+            state = None
+
+        if state is None:
+            self._acr_filter_disabled = True
+            return
+        state["batch_size"] = batch_size
+        self._acr_filter_state = state
+
+    def _load_textcnn_filter_model(self, model_name: str, device: torch.device, cfg: dict) -> Optional[dict]:
+        try:
+            resolved_model_dir = None
+            if os.path.isdir(model_name):
+                resolved_model_dir = model_name
+            else:
+                local_name = os.path.basename(str(model_name).rstrip("/"))
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+                candidate_dirs = [
+                    os.path.join(os.getcwd(), "dataset", "models", local_name),
+                    os.path.join(repo_root, "dataset", "models", local_name),
+                ]
+                for candidate_dir in candidate_dirs:
+                    if os.path.isdir(candidate_dir):
+                        resolved_model_dir = candidate_dir
+                        break
+
+            if resolved_model_dir is not None:
+                model_path = os.path.join(resolved_model_dir, "model.pt")
+                metrics_path = os.path.join(resolved_model_dir, "metrics.json")
+            else:
+                from huggingface_hub import hf_hub_download
+
+                model_path = hf_hub_download(model_name, "model.pt")
+                try:
+                    metrics_path = hf_hub_download(model_name, "metrics.json")
+                except Exception:
+                    metrics_path = None
+
+            payload = torch.load(model_path, map_location="cpu", weights_only=False)
+            state_dict = payload.get("state_dict")
+            vocab = payload.get("vocab") or {}
+            if state_dict is None or not vocab:
+                raise ValueError("textcnn model.pt missing state_dict or vocab")
+
+            metrics = {}
+            if metrics_path and os.path.exists(metrics_path):
+                with open(metrics_path, "r", encoding="utf-8") as f:
+                    metrics = json.load(f)
+
+            embed_dim = int(metrics.get("embed_dim", 200))
+            kernel_sizes = metrics.get("kernel_sizes", [3, 4, 5])
+            if isinstance(kernel_sizes, str):
+                kernel_sizes = [int(x) for x in kernel_sizes.split(",") if x.strip()]
+            num_filters = int(metrics.get("num_filters", 256))
+            model = _TextCNNModel(len(vocab), embed_dim, kernel_sizes, num_filters)
+            model.load_state_dict(state_dict)
+            model.eval()
+            model.to(device)
+
+            max_tokens = cfg.get("filter_max_tokens")
+            if not max_tokens:
+                max_tokens = cfg.get("filter_max_length")
+            if not max_tokens and "max_tokens" in metrics:
+                max_tokens = metrics.get("max_tokens")
+            if max_tokens is not None:
+                max_tokens = int(max_tokens)
+                if max_tokens <= 0:
+                    max_tokens = None
+
+            text_mode = str(cfg.get("filter_text_mode", "response_prompt")).lower().strip()
+            if text_mode not in {"response_prompt", "response", "prompt"}:
+                text_mode = "response_prompt"
+
+            return {
+                "type": "textcnn",
+                "model": model,
+                "device": device,
+                "vocab": vocab,
+                "max_tokens": max_tokens,
+                "text_mode": text_mode,
+            }
+        except Exception as exc:
+            print(f"ACR filter textcnn init failed: {exc}")
+            return None
+
+    def _acr_filter_score_pairs(self, prompt_texts: list[str], response_texts: list[str]) -> Optional[list[float]]:
+        state = self._acr_filter_state
+        if state is None:
+            return None
+        if state.get("type") == "textcnn":
+            return self._acr_filter_score_textcnn(prompt_texts, response_texts, state)
+        return self._acr_filter_score_hf(prompt_texts, response_texts, state)
+
+    def _acr_filter_score_hf(self, prompt_texts: list[str], response_texts: list[str], state: dict) -> list[float]:
+        model = state["model"]
+        tokenizer = state["tokenizer"]
+        device = state["device"]
+        max_length = state["max_length"]
+        good_id = int(state.get("good_id", 1))
+        batch_size = int(state.get("batch_size") or 64)
+        scores: list[float] = []
+        model.eval()
+
+        for start in range(0, len(prompt_texts), batch_size):
+            batch_prompts = prompt_texts[start : start + batch_size]
+            batch_responses = response_texts[start : start + batch_size]
+            enc = tokenizer(
+                batch_prompts,
+                batch_responses,
+                truncation="only_first",
+                max_length=max_length,
+                padding=True,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            with torch.no_grad():
+                logits = model(**enc).logits
+                probs = torch.softmax(logits, dim=-1)
+                scores.extend(probs[:, good_id].detach().cpu().tolist())
+        return scores
+
+    def _textcnn_build_tokens(
+        self,
+        prompt: str,
+        response: str,
+        text_mode: str,
+        max_tokens: Optional[int],
+    ) -> list[str]:
+        prompt_tokens = _TEXTCNN_TOKEN_RE.findall((prompt or "").lower())
+        response_tokens = _TEXTCNN_TOKEN_RE.findall((response or "").lower())
+        if text_mode == "response":
+            tokens = response_tokens
+            return tokens[:max_tokens] if max_tokens else tokens
+        if text_mode == "prompt":
+            tokens = prompt_tokens
+            return tokens[:max_tokens] if max_tokens else tokens
+
+        if max_tokens is not None:
+            if len(response_tokens) >= max_tokens:
+                response_tokens = response_tokens[:max_tokens]
+                prompt_tokens = []
+            else:
+                budget = max_tokens - len(response_tokens)
+                prompt_tokens = prompt_tokens[:budget]
+        return response_tokens + ["sep"] + prompt_tokens
+
+    def _acr_filter_score_textcnn(self, prompt_texts: list[str], response_texts: list[str], state: dict) -> list[float]:
+        model = state["model"]
+        device = state["device"]
+        vocab = state["vocab"]
+        max_tokens = state.get("max_tokens")
+        text_mode = state.get("text_mode", "response_prompt")
+        batch_size = int(state.get("batch_size") or 64)
+        scores: list[float] = []
+        model.eval()
+        debug_remaining = int(getattr(self, "_acr_filter_debug_remaining", 0) or 0)
+
+        def truncate_text(text: str, max_chars: int = 400) -> str:
+            cleaned = (text or "").replace("\n", " ").replace("\r", " ").strip()
+            if len(cleaned) <= max_chars:
+                return cleaned
+            return cleaned[:max_chars].rstrip() + "..."
+
+        for start in range(0, len(prompt_texts), batch_size):
+            batch_prompts = prompt_texts[start : start + batch_size]
+            batch_responses = response_texts[start : start + batch_size]
+            seqs: list[list[int]] = []
+            debug_items: list[tuple[int, str, str, list[str]]] = []
+            for prompt, response in zip(batch_prompts, batch_responses):
+                tokens = self._textcnn_build_tokens(prompt, response, text_mode, max_tokens)
+                if not tokens:
+                    tokens = ["<unk>"]
+                if debug_remaining > 0 and len(debug_items) < debug_remaining:
+                    debug_items.append((len(seqs), prompt, response, tokens))
+                seqs.append([vocab.get(tok, 1) for tok in tokens])
+            if not seqs:
+                continue
+            max_len = max(len(seq) for seq in seqs)
+            if max_tokens:
+                max_len = min(max_len, int(max_tokens))
+            if max_len <= 0:
+                max_len = 1
+            padded = []
+            for seq in seqs:
+                if len(seq) >= max_len:
+                    padded.append(seq[:max_len])
+                else:
+                    padded.append(seq + [0] * (max_len - len(seq)))
+            x = torch.tensor(padded, dtype=torch.long, device=device)
+            with torch.no_grad():
+                logits = model(x)
+                probs = torch.softmax(logits, dim=-1)
+                batch_scores = probs[:, 1].detach().cpu().tolist()
+                scores.extend(batch_scores)
+            if debug_remaining > 0 and debug_items:
+                for idx, prompt, response, tokens in debug_items:
+                    if debug_remaining <= 0:
+                        break
+                    score_val = float(batch_scores[idx]) if idx < len(batch_scores) else float("nan")
+                    token_preview = " ".join(tokens[:120])
+                    if len(tokens) > 120:
+                        token_preview = token_preview + " ..."
+                    step = getattr(self, "global_steps", None)
+                    step_str = f" step={step}" if step is not None else ""
+                    print("***** ACRD ML FILTER DEBUG *****")
+                    print(
+                        f"score={score_val:.4f} text_mode={text_mode} "
+                        f"max_tokens={max_tokens if max_tokens else 'none'} tokens={len(tokens)}"
+                        + step_str
+                    )
+                    if text_mode != "response":
+                        print("prompt_preview=" + truncate_text(prompt))
+                    print("response_preview=" + truncate_text(response))
+                    print("input_tokens_preview=" + truncate_text(token_preview, max_chars=500))
+                    print("*****")
+                    debug_remaining -= 1
+                self._acr_filter_debug_remaining = max(0, debug_remaining)
+        return scores
+
     def _collect_distill_candidates(
         self,
-        batch: DataProto,
+        batch: Optional[DataProto],
         reward_scalar: Optional[torch.Tensor],
         reward_threshold_scalar: Optional[torch.Tensor] = None,
+        reward_extra_infos: Optional[dict] = None,
+        rollout_batch: Optional[DataProto] = None,
+        rollout_reward_scalar: Optional[torch.Tensor] = None,
+        uid_max_rewards: Optional[dict[str, float]] = None,
     ) -> dict[str, float]:
         cfg = self._distill_cfg
+        if str(cfg.get("method", "sft")).lower().strip() == "dpo" and self._distill_source == "acr":
+            return self._collect_distill_candidates_dpo(
+                batch=batch,
+                reward_scalar=reward_scalar,
+                reward_threshold_scalar=reward_threshold_scalar,
+                reward_extra_infos=reward_extra_infos,
+                rollout_batch=rollout_batch,
+                rollout_reward_scalar=rollout_reward_scalar,
+                uid_max_rewards=uid_max_rewards,
+            )
         if not cfg.get("enabled", False) or reward_scalar is None:
             return {}
 
@@ -1871,6 +3170,26 @@ class RayPPOTrainer:
             if isinstance(threshold_list, list) and len(threshold_list) == len(reward_list):
                 reward_threshold_list = threshold_list
 
+        base_scores_list = None
+        extracted_list = None
+        leak_hits_list = None
+        if isinstance(reward_extra_infos, dict):
+            base_scores_list = reward_extra_infos.get("acr_base_score")
+            extracted_list = reward_extra_infos.get("acr_extracted")
+            leak_hits_list = reward_extra_infos.get("acr_leak_hit")
+        if isinstance(base_scores_list, np.ndarray):
+            base_scores_list = base_scores_list.tolist()
+        if not isinstance(base_scores_list, list) or len(base_scores_list) != len(reward_list):
+            base_scores_list = None
+        if isinstance(extracted_list, np.ndarray):
+            extracted_list = extracted_list.tolist()
+        if not isinstance(extracted_list, list) or len(extracted_list) != len(reward_list):
+            extracted_list = None
+        if isinstance(leak_hits_list, np.ndarray):
+            leak_hits_list = leak_hits_list.tolist()
+        if not isinstance(leak_hits_list, list) or len(leak_hits_list) != len(reward_list):
+            leak_hits_list = None
+
         responses = batch.batch.get("responses")
         if responses is None:
             return {}
@@ -1891,6 +3210,35 @@ class RayPPOTrainer:
         if pad_id is None:
             pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
 
+        response_ids_cache: dict[int, list[int]] = {}
+        response_text_cache: dict[int, str] = {}
+
+        def extract_response_ids(idx: int) -> list[int]:
+            cached = response_ids_cache.get(idx)
+            if cached is not None:
+                return cached
+            if response_mask is not None:
+                valid_len = int(response_mask[idx].sum().item())
+                response_ids = responses[idx][:valid_len].tolist()
+            else:
+                response_ids = responses[idx].tolist()
+                while response_ids and response_ids[-1] == pad_id:
+                    response_ids.pop()
+            response_ids_cache[idx] = response_ids
+            return response_ids
+
+        def extract_response_text(idx: int) -> str:
+            cached = response_text_cache.get(idx)
+            if cached is not None:
+                return cached
+            response_ids = extract_response_ids(idx)
+            if response_ids:
+                text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            else:
+                text = ""
+            response_text_cache[idx] = text
+            return text
+
         def mean_nll(idx: int) -> Optional[float]:
             if log_probs is None or response_mask is None:
                 return None
@@ -1900,44 +3248,377 @@ class RayPPOTrainer:
                 return None
             return float(-(log_probs[idx] * mask).sum().item() / denom.item())
 
+        def response_len(idx: int) -> int:
+            if response_mask is not None:
+                return int(response_mask[idx].sum().item())
+            resp = responses[idx]
+            if resp.numel() == 0:
+                return 0
+            if pad_id is None:
+                return int(resp.numel())
+            non_pad = (resp != pad_id).nonzero(as_tuple=False)
+            if non_pad.numel() == 0:
+                return 0
+            return int(non_pad[-1].item() + 1)
+
+        def get_base_score(idx: int) -> Optional[float]:
+            base_score = reward_threshold_list[idx]
+            if base_scores_list is not None:
+                base_score = base_scores_list[idx]
+            return base_score
+
+        disable_filters = bool(cfg.get("disable_filters", False))
+        filter_mode = (
+            self._acr_filter_mode(disable_filters) if self._distill_source == "acr" else "heuristic"
+        )
+        use_ml = False
+        use_heuristics = False
+        degenerate_filter = False
+
+        def update_filter_flags() -> None:
+            nonlocal use_ml, use_heuristics, degenerate_filter
+            use_ml = filter_mode in {"ml", "ml+heuristic"}
+            use_heuristics = filter_mode in {"heuristic", "ml+heuristic"}
+            degenerate_filter = bool(cfg.get("degenerate_filter", False)) if use_heuristics else False
+
+        update_filter_flags()
+        self._acr_filter_debug_remaining = (
+            int(getattr(self, "_acr_filter_debug_samples", 0) or 0) if use_ml else 0
+        )
+
+        degenerate_min_tokens = int(cfg.get("degenerate_min_tokens", 0) or 0)
+        try:
+            degenerate_rep_3_max = float(cfg.get("degenerate_rep_3_max", 1.0))
+        except (TypeError, ValueError):
+            degenerate_rep_3_max = 1.0
+        try:
+            degenerate_rep_4_max = float(cfg.get("degenerate_rep_4_max", 1.0))
+        except (TypeError, ValueError):
+            degenerate_rep_4_max = 1.0
+        degenerate_rep_3_max = min(max(degenerate_rep_3_max, 0.0), 1.0)
+        degenerate_rep_4_max = min(max(degenerate_rep_4_max, 0.0), 1.0)
+        degenerate_window_size = int(cfg.get("degenerate_window_size", 24) or 0)
+        degenerate_window_stride = int(cfg.get("degenerate_window_stride", max(1, degenerate_window_size // 2)) or 1)
+        try:
+            degenerate_window_jaccard = float(cfg.get("degenerate_window_jaccard", 0.9))
+        except (TypeError, ValueError):
+            degenerate_window_jaccard = 0.9
+        try:
+            degenerate_sentence_sim = float(cfg.get("degenerate_sentence_sim", 0.75))
+        except (TypeError, ValueError):
+            degenerate_sentence_sim = 0.9
+        degenerate_sentence_window = int(cfg.get("degenerate_sentence_window", 6) or 0)
+        degenerate_sentence_min_words = int(cfg.get("degenerate_sentence_min_words", 6) or 0)
+        degenerate_window_jaccard = min(max(degenerate_window_jaccard, 0.0), 1.0)
+        degenerate_sentence_sim = min(max(degenerate_sentence_sim, 0.0), 1.0)
+
+        def distinct_ngram_ratio(tokens: list[int], n: int) -> float:
+            total = len(tokens) - n + 1
+            if total <= 0:
+                return 1.0
+            ngrams = {tuple(tokens[i : i + n]) for i in range(total)}
+            return len(ngrams) / total
+
+        def has_repeated_window(tokens: list[int]) -> bool:
+            if degenerate_window_size <= 0 or len(tokens) < degenerate_window_size * 2:
+                return False
+            stride = max(1, degenerate_window_stride)
+            windows: list[tuple[int, set[tuple[int, int, int]]]] = []
+            seen_exact: set[tuple[int, ...]] = set()
+            max_start = len(tokens) - degenerate_window_size
+            for start in range(0, max_start + 1, stride):
+                window = tokens[start : start + degenerate_window_size]
+                window_key = tuple(window)
+                if window_key in seen_exact:
+                    return True
+                seen_exact.add(window_key)
+                if len(window) < 3:
+                    continue
+                ngrams = {tuple(window[i : i + 3]) for i in range(len(window) - 2)}
+                windows.append((start, ngrams))
+            for i in range(len(windows)):
+                start_i, grams_i = windows[i]
+                for j in range(i + 1, len(windows)):
+                    start_j, grams_j = windows[j]
+                    if abs(start_i - start_j) < degenerate_window_size:
+                        continue
+                    union = grams_i | grams_j
+                    if not union:
+                        continue
+                    jaccard = len(grams_i & grams_j) / len(union)
+                    if jaccard >= degenerate_window_jaccard:
+                        return True
+            return False
+
+        def sentence_near_duplicate(text: str) -> bool:
+            if not text or degenerate_sentence_sim <= 0.0:
+                return False
+            raw_parts = re.split(r"[.!?]+|\\n+", text)
+            sentences = []
+            for part in raw_parts:
+                cleaned = re.sub(r"[^a-z0-9\\s]", "", part.lower())
+                cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+                if not cleaned:
+                    continue
+                if degenerate_sentence_min_words and len(cleaned.split()) < degenerate_sentence_min_words:
+                    continue
+                sentences.append(cleaned)
+            if len(sentences) < 2:
+                return False
+            window = max(1, degenerate_sentence_window)
+            for i in range(len(sentences)):
+                left = sentences[i]
+                for j in range(i + 1, min(len(sentences), i + 1 + window)):
+                    if SequenceMatcher(None, left, sentences[j]).ratio() >= degenerate_sentence_sim:
+                        return True
+            return False
+
+        def is_degenerate(tokens: list[int], idx: Optional[int] = None) -> bool:
+            if not degenerate_filter or len(tokens) < degenerate_min_tokens:
+                return False
+            rep_3 = 1.0 - distinct_ngram_ratio(tokens, 3)
+            rep_4 = 1.0 - distinct_ngram_ratio(tokens, 4)
+            if rep_3 >= degenerate_rep_3_max or rep_4 >= degenerate_rep_4_max:
+                return True
+            if has_repeated_window(tokens):
+                return True
+            if idx is not None:
+                response_text = extract_response_text(idx)
+                if sentence_near_duplicate(response_text):
+                    return True
+            return False
+
         grouped: dict[str, list[int]] = {}
+        skip_uids: set[str] = set()
+        skipped_task = 0
         for idx, uid in enumerate(uid_list):
-            grouped.setdefault(str(uid), []).append(idx)
+            uid_str = str(uid)
+            if self._acr_should_skip_task(task_list[idx], extra_list[idx]):
+                skip_uids.add(uid_str)
+                skipped_task += 1
+                continue
+            grouped.setdefault(uid_str, []).append(idx)
+
+        degenerate_checked = 0
+        degenerate_filtered = 0
+        heuristic_input = 0
+        heuristic_passed = 0
+        heuristic_ok_by_idx: Optional[dict[int, bool]] = None
+
+        def ensure_heuristics_scored() -> None:
+            nonlocal heuristic_ok_by_idx, degenerate_checked, degenerate_filtered, heuristic_input, heuristic_passed
+            if heuristic_ok_by_idx is not None:
+                return
+            heuristic_ok_by_idx = {}
+            if self._distill_source != "acr" or not use_heuristics:
+                return
+            for idxs in grouped.values():
+                for i in idxs:
+                    base_score = get_base_score(i)
+                    if base_score is None or base_score < threshold:
+                        continue
+                    heuristic_input += 1
+                    if leak_hits_list is not None and bool(leak_hits_list[i]):
+                        continue
+                    if degenerate_filter:
+                        degenerate_checked += 1
+                        response_ids = extract_response_ids(i)
+                        if not response_ids or is_degenerate(response_ids, idx=i):
+                            degenerate_filtered += 1
+                            continue
+                    heuristic_ok_by_idx[i] = True
+                    heuristic_passed += 1
+
+        ml_scores_by_idx: dict[int, float] = {}
+        ml_checked = 0
+        ml_kept = 0
+        filter_threshold = float(cfg.get("filter_threshold", 0.5))
+        if self._distill_source == "acr" and use_ml:
+            self._maybe_init_acr_filter_model()
+            if self._acr_filter_state is None:
+                if disable_filters:
+                    filter_mode = "off"
+                    update_filter_flags()
+                else:
+                    filter_mode = "heuristic"
+                    update_filter_flags()
+            else:
+                if use_heuristics:
+                    ensure_heuristics_scored()
+                idxs_to_score: list[int] = []
+                prompt_texts: list[str] = []
+                response_texts: list[str] = []
+                for idxs in grouped.values():
+                    for i in idxs:
+                        base_score = get_base_score(i)
+                        if base_score is None or base_score < threshold:
+                            continue
+                        if use_heuristics and not heuristic_ok_by_idx.get(i, False):
+                            continue
+                        response_text = extract_response_text(i)
+                        if not response_text:
+                            continue
+                        prompt_texts.append(self._extract_prompt_text(extra_list[i]))
+                        response_texts.append(response_text)
+                        idxs_to_score.append(i)
+                if idxs_to_score:
+                    scores = self._acr_filter_score_pairs(prompt_texts, response_texts)
+                    if scores is None or len(scores) != len(idxs_to_score):
+                        print("ACR filter model returned invalid scores; disabling filter.")
+                        if disable_filters:
+                            filter_mode = "off"
+                            update_filter_flags()
+                        else:
+                            filter_mode = "heuristic"
+                            update_filter_flags()
+                    else:
+                        for idx, score in zip(idxs_to_score, scores):
+                            try:
+                                score_val = float(score)
+                            except (TypeError, ValueError):
+                                score_val = float("nan")
+                            if not math.isfinite(score_val):
+                                score_val = -1.0
+                            ml_scores_by_idx[idx] = score_val
+                            ml_checked += 1
+                            if score_val >= filter_threshold:
+                                ml_kept += 1
 
         total_groups = len(grouped)
         selected_groups = 0
         selected_rewards: list[float] = []
-        selected_entropy: list[float] = []
+        selected_tiebreak: list[float] = []
         hint_count = 0
         nohint_count = 0
         records = []
+        entropy_sampling = bool(cfg.get("entropy_sampling", False))
+        entropy_beta = cfg.get("entropy_beta", 1.0)
+        try:
+            entropy_beta = float(entropy_beta)
+        except (TypeError, ValueError):
+            entropy_beta = 1.0
+        rng = np.random.default_rng()
+
+        tiebreak_mode = str(cfg.get("entropy_tiebreak", "mean_nll"))
+        selection_mode = str(cfg.get("selection_mode", "random")).lower().strip()
+        if selection_mode in {"max_reward", "top_reward", "best", "reward"}:
+            selection_mode = "top_reward"
+        elif selection_mode in {"ml_score", "ml", "model_score"}:
+            selection_mode = "ml_score"
+        elif selection_mode in {"random", "rand", "uniform"}:
+            selection_mode = "random"
+        else:
+            selection_mode = "random"
+        if use_ml:
+            selection_mode = "ml_score"
+
+        if self._distill_source == "acr" and use_heuristics:
+            ensure_heuristics_scored()
 
         for uid, idxs in grouped.items():
-            eligible = [i for i in idxs if reward_threshold_list[i] >= threshold]
+            if self._distill_source == "acr":
+                eligible = []
+                for i in idxs:
+                    base_score = get_base_score(i)
+                    if base_score is None:
+                        continue
+                    if base_score < threshold:
+                        continue
+                    if use_heuristics and not heuristic_ok_by_idx.get(i, False):
+                        continue
+                    if use_ml:
+                        score_val = ml_scores_by_idx.get(i)
+                        if score_val is None or score_val < filter_threshold:
+                            continue
+                    eligible.append(i)
+            else:
+                eligible = [i for i in idxs if reward_threshold_list[i] >= threshold]
+                if degenerate_filter:
+                    degenerate_checked += len(eligible)
+                    kept = []
+                    for i in eligible:
+                        response_ids = extract_response_ids(i)
+                        if not response_ids or is_degenerate(response_ids, idx=i):
+                            degenerate_filtered += 1
+                            continue
+                        kept.append(i)
+                    eligible = kept
             if not eligible:
                 continue
-            max_reward = max(reward_list[i] for i in eligible)
-            top = [i for i in eligible if reward_list[i] >= (max_reward - 1e-6)]
-            top.sort()
-
-            entropy_mode = str(cfg.get("entropy_tiebreak", "mean_nll"))
-            chosen_idx = top[0]
-            entropy_proxy = None
-            if len(top) > 1 and entropy_mode == "mean_nll":
-                entropy_map = {i: mean_nll(i) for i in top}
-                chosen_idx = max(top, key=lambda i: (entropy_map.get(i, float("-inf")), -i))
-                entropy_proxy = entropy_map.get(chosen_idx)
+            chosen_idx = None
+            tiebreak_proxy = None
+            if selection_mode == "random":
+                chosen_idx = int(rng.choice(eligible))
+                if tiebreak_mode in {"response_len", "length"}:
+                    tiebreak_proxy = response_len(chosen_idx)
+                else:
+                    tiebreak_proxy = mean_nll(chosen_idx)
+            elif selection_mode == "ml_score":
+                score_pairs = []
+                for i in eligible:
+                    score_val = ml_scores_by_idx.get(i)
+                    if score_val is None or not math.isfinite(score_val):
+                        continue
+                    score_pairs.append((i, float(score_val)))
+                if not score_pairs:
+                    chosen_idx = int(rng.choice(eligible))
+                else:
+                    max_score = max(score for _, score in score_pairs)
+                    top = [i for i, score in score_pairs if score >= (max_score - 1e-6)]
+                    chosen_idx = int(rng.choice(top))
             else:
-                entropy_proxy = mean_nll(chosen_idx)
+                max_reward = max(reward_list[i] for i in eligible)
+                top = [i for i in eligible if reward_list[i] >= (max_reward - 1e-6)]
+                top.sort()
+
+                entropy_mode = tiebreak_mode
+                chosen_idx = top[0]
+                if len(top) > 1:
+                    if entropy_mode in {"response_len", "length"}:
+                        length_map = {i: response_len(i) for i in top}
+                        chosen_idx = max(top, key=lambda i: (length_map.get(i, -1), -i))
+                        tiebreak_proxy = length_map.get(chosen_idx)
+                    else:
+                        entropy_map = {i: mean_nll(i) for i in top}
+                        valid = [(i, val) for i, val in entropy_map.items() if val is not None]
+                        if not valid:
+                            chosen_idx = top[0]
+                            tiebreak_proxy = entropy_map.get(chosen_idx)
+                        elif entropy_sampling:
+                            idxs_only = [item[0] for item in valid]
+                            vals = np.array([item[1] for item in valid], dtype=np.float64)
+                            if not np.isfinite(vals).all():
+                                vals = np.nan_to_num(vals, nan=-1e6, posinf=1e6, neginf=-1e6)
+                            vals = vals * entropy_beta
+                            vals = vals - np.max(vals)
+                            weights = np.exp(vals)
+                            total = float(weights.sum())
+                            if total <= 0 or not np.isfinite(total):
+                                probs = np.ones_like(weights) / max(1, len(weights))
+                            else:
+                                probs = weights / total
+                            chosen_idx = int(rng.choice(idxs_only, p=probs))
+                            tiebreak_proxy = entropy_map.get(chosen_idx)
+                        else:
+                            chosen_idx = max(
+                                [item[0] for item in valid],
+                                key=lambda i: (entropy_map.get(i, float("-inf")), -i),
+                            )
+                            tiebreak_proxy = entropy_map.get(chosen_idx)
+                else:
+                    if entropy_mode in {"response_len", "length"}:
+                        tiebreak_proxy = response_len(chosen_idx)
+                    else:
+                        tiebreak_proxy = mean_nll(chosen_idx)
 
             extra_info = extra_list[chosen_idx]
             prompt_nohint = None
             hint_used = False
             if isinstance(extra_info, dict):
                 if self._distill_source == "acr":
-                    prompt_nohint = extra_info.get("acr_prompt")
+                    prompt_nohint = extra_info.get("acr_orig_prompt")
                     if not isinstance(prompt_nohint, list):
-                        prompt_nohint = extra_info.get("acr_prompt_nohint")
+                        prompt_nohint = extra_info.get("orig_prompt")
                     hint_used = True
                 else:
                     prompt_nohint = extra_info.get("slhc_prompt_nohint")
@@ -1951,13 +3632,7 @@ class RayPPOTrainer:
             if not isinstance(prompt_nohint, list):
                 continue
 
-            if response_mask is not None:
-                valid_len = int(response_mask[chosen_idx].sum().item())
-                response_ids = responses[chosen_idx][:valid_len].tolist()
-            else:
-                response_ids = responses[chosen_idx].tolist()
-                while response_ids and response_ids[-1] == pad_id:
-                    response_ids.pop()
+            response_ids = extract_response_ids(chosen_idx)
 
             if not response_ids:
                 continue
@@ -1969,14 +3644,14 @@ class RayPPOTrainer:
                 "response_ids": response_ids,
                 "response_text": None,
                 "reward": float(reward_list[chosen_idx]),
-                "entropy_proxy": entropy_proxy,
+                "entropy_proxy": tiebreak_proxy,
                 "hint_used": hint_used,
             }
             records.append(record)
             selected_groups += 1
             selected_rewards.append(record["reward"])
-            if entropy_proxy is not None:
-                selected_entropy.append(entropy_proxy)
+            if tiebreak_proxy is not None:
+                selected_tiebreak.append(float(tiebreak_proxy))
             if hint_used:
                 hint_count += 1
             else:
@@ -1989,7 +3664,364 @@ class RayPPOTrainer:
                 world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
                 max_local = max(1, int(math.ceil(max_buffer / world_size)))
                 if len(self._distill_buffer_local) > max_local:
-                    self._distill_buffer_local = self._distill_buffer_local[-max_local:]
+                    buffer_mode = str(cfg.get("buffer_mode", "rolling")).lower().strip()
+                    if buffer_mode != "flush":
+                        self._distill_buffer_local = self._distill_buffer_local[-max_local:]
+
+        metrics: dict[str, float] = {}
+        if total_groups > 0:
+            metrics["distill/uid_group_frac"] = float(selected_groups / max(1, total_groups))
+            metrics["distill/uid_group_count"] = float(selected_groups)
+            metrics["distill/uid_group_total"] = float(total_groups)
+        if heuristic_input > 0:
+            metrics["distill/heuristic_input"] = float(heuristic_input)
+            metrics["distill/heuristic_passed"] = float(heuristic_passed)
+            metrics["distill/heuristic_passed_frac"] = float(heuristic_passed / max(1, heuristic_input))
+        if degenerate_filter and degenerate_checked > 0:
+            metrics["distill/degenerate_filtered"] = float(degenerate_filtered)
+            metrics["distill/degenerate_filtered_frac"] = float(degenerate_filtered / max(1, degenerate_checked))
+        if use_ml:
+            metrics["distill/ml_filter_input"] = float(ml_checked)
+            metrics["distill/ml_filter_passed"] = float(ml_kept)
+            if ml_checked > 0:
+                metrics["distill/ml_filter_passed_frac"] = float(ml_kept / max(1, ml_checked))
+            metrics["distill/ml_filter_threshold"] = float(filter_threshold)
+        if selected_rewards:
+            metrics["distill/selected_reward_mean"] = float(np.mean(selected_rewards))
+        if selected_tiebreak:
+            if tiebreak_mode in {"response_len", "length"}:
+                metrics["distill/response_len_mean"] = float(np.mean(selected_tiebreak))
+                metrics["distill/response_len_max"] = float(np.max(selected_tiebreak))
+            else:
+                metrics["distill/entropy_proxy_mean"] = float(np.mean(selected_tiebreak))
+                metrics["distill/entropy_proxy_max"] = float(np.max(selected_tiebreak))
+        metrics["distill/selected_hint_count"] = float(hint_count)
+        metrics["distill/selected_nohint_count"] = float(nohint_count)
+        metrics["distill/buffer_size_local"] = float(len(self._distill_buffer_local))
+        if skipped_task:
+            metrics["distill/skip_task"] = float(skipped_task)
+        return metrics
+
+    def _collect_distill_candidates_dpo(
+        self,
+        batch: Optional[DataProto],
+        reward_scalar: Optional[torch.Tensor],
+        reward_threshold_scalar: Optional[torch.Tensor] = None,
+        reward_extra_infos: Optional[dict] = None,
+        rollout_batch: Optional[DataProto] = None,
+        rollout_reward_scalar: Optional[torch.Tensor] = None,
+        uid_max_rewards: Optional[dict[str, float]] = None,
+    ) -> dict[str, float]:
+        cfg = self._distill_cfg
+        if not cfg.get("enabled", False) or rollout_batch is None or rollout_reward_scalar is None:
+            return {}
+
+        uid_arr = rollout_batch.non_tensor_batch.get("uid")
+        extra_arr = rollout_batch.non_tensor_batch.get("extra_info")
+        if uid_arr is None or extra_arr is None:
+            return {}
+
+        uid_list = np.asarray(uid_arr, dtype=object).tolist()
+        extra_list = np.asarray(extra_arr, dtype=object).tolist()
+        task_arr = rollout_batch.non_tensor_batch.get("data_source")
+        if task_arr is not None:
+            task_list = np.asarray(task_arr, dtype=object).tolist()
+        else:
+            task_list = [None] * len(uid_list)
+
+        rollout_reward_list = rollout_reward_scalar.detach().cpu().tolist()
+        if len(uid_list) != len(rollout_reward_list):
+            return {}
+
+        if uid_max_rewards is None:
+            uid_max_rewards, _ = self._compute_uid_max_rewards(rollout_batch, rollout_reward_scalar)
+        if not uid_max_rewards:
+            return {}
+
+        eps = 1e-6
+        threshold = float(cfg.get("reward_threshold", 1.0))
+        perfect_uids = {uid for uid, score in uid_max_rewards.items() if score >= 1.0 - eps}
+        if skip_uids:
+            perfect_uids = {uid for uid in perfect_uids if uid not in skip_uids}
+
+        dpo_cfg = cfg.get("dpo", {})
+        if not isinstance(dpo_cfg, dict):
+            dpo_cfg = {}
+
+        rollout_n = int(getattr(self, "_acr_rollout_n", 1) or 1)
+
+        def tiebreak(uid: str, idx: int, tag: str) -> int:
+            token = f"{uid}-{tag}-{idx}".encode("utf-8")
+            return int.from_bytes(hashlib.md5(token).digest()[:8], "big")
+
+        def listify(value: Any, length: int) -> Optional[list]:
+            if isinstance(value, np.ndarray):
+                value = value.tolist()
+            if isinstance(value, list) and len(value) == length:
+                return value
+            return None
+
+        def resolve_prompt_nohint(extra_info: Any, raw_prompt: Any) -> Optional[list[dict]]:
+            if isinstance(extra_info, dict):
+                for key in ("acr_orig_prompt", "orig_prompt", "slhc_prompt_nohint", "tarba_prompt_no_tool"):
+                    val = extra_info.get(key)
+                    if isinstance(val, list):
+                        return val
+            if isinstance(raw_prompt, list):
+                return raw_prompt
+            return None
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        def extract_response_ids(
+            responses: torch.Tensor, response_mask: Optional[torch.Tensor], idx: int
+        ) -> Optional[list[int]]:
+            if response_mask is not None:
+                valid_len = int(response_mask[idx].sum().item())
+                response_ids = responses[idx][:valid_len].tolist()
+            else:
+                response_ids = responses[idx].tolist()
+                while response_ids and response_ids[-1] == pad_id:
+                    response_ids.pop()
+            return response_ids or None
+
+        grouped: dict[str, list[int]] = {}
+        for idx, uid in enumerate(uid_list):
+            grouped.setdefault(str(uid), []).append(idx)
+
+        selected_rollout_idxs: list[int] = []
+        for uid, idxs in grouped.items():
+            if uid not in perfect_uids:
+                continue
+            idxs_sorted = sorted(
+                idxs,
+                key=lambda i: (-float(rollout_reward_list[i]), tiebreak(uid, i, "rollout")),
+            )
+            selected_rollout_idxs.extend(idxs_sorted[: min(rollout_n, len(idxs_sorted))])
+
+        rollout_rubric_list: Optional[list] = None
+        rollout_extracted_list: Optional[list] = None
+        if selected_rollout_idxs:
+            rollout_subset = rollout_batch.select_idxs(selected_rollout_idxs)
+            extra_infos = rollout_subset.non_tensor_batch.get("extra_info")
+            if extra_infos is None:
+                extra_list_subset = [{} for _ in range(len(rollout_subset))]
+            else:
+                extra_list_subset = [
+                    dict(info) if isinstance(info, dict) else {} for info in np.asarray(extra_infos, dtype=object)
+                ]
+            raw_prompt_arr = rollout_subset.non_tensor_batch.get("raw_prompt")
+            raw_prompt_list = (
+                np.asarray(raw_prompt_arr, dtype=object).tolist() if raw_prompt_arr is not None else None
+            )
+            prompt_texts = None
+            prompts = rollout_subset.batch.get("prompts") if rollout_subset.batch is not None else None
+            if raw_prompt_list is None and prompts is not None:
+                prompt_texts = self.tokenizer.batch_decode(prompts.detach().cpu(), skip_special_tokens=True)
+            for i, info in enumerate(extra_list_subset):
+                if not isinstance(info.get("acr_orig_prompt"), list):
+                    msg = None
+                    if raw_prompt_list is not None and isinstance(raw_prompt_list[i], list):
+                        msg = raw_prompt_list[i]
+                    elif prompt_texts is not None:
+                        msg = [{"role": "user", "content": str(prompt_texts[i])}]
+                    if msg is not None:
+                        info["acr_orig_prompt"] = msg
+                extra_list_subset[i] = info
+            rollout_subset.non_tensor_batch["extra_info"] = np.array(extra_list_subset, dtype=object)
+
+            _, rollout_reward_extra = compute_reward(rollout_subset, self._acr_reward_fn)
+            rollout_rubric_list = rollout_reward_extra.get("acr_rubric_score")
+            if rollout_rubric_list is None:
+                rollout_rubric_list = rollout_reward_extra.get("acr_rubric")
+            rollout_extracted_list = rollout_reward_extra.get("acr_extracted")
+            rollout_rubric_list = listify(rollout_rubric_list, len(selected_rollout_idxs))
+            rollout_extracted_list = listify(rollout_extracted_list, len(selected_rollout_idxs))
+
+        rollout_responses = rollout_batch.batch.get("responses")
+        if rollout_responses is None:
+            return {}
+        rollout_responses = rollout_responses.detach().cpu()
+        rollout_response_mask = rollout_batch.batch.get("response_mask")
+        if rollout_response_mask is not None:
+            rollout_response_mask = rollout_response_mask.detach().cpu()
+        raw_prompt_arr = rollout_batch.non_tensor_batch.get("raw_prompt")
+        raw_prompt_list = np.asarray(raw_prompt_arr, dtype=object).tolist() if raw_prompt_arr is not None else None
+
+        candidates_by_uid: dict[str, list[dict]] = {}
+
+        def add_candidate(uid: str, candidate: dict) -> None:
+            candidates_by_uid.setdefault(uid, []).append(candidate)
+
+        for pos, idx in enumerate(selected_rollout_idxs):
+            uid = str(uid_list[idx])
+            if uid not in perfect_uids:
+                continue
+            response_ids = extract_response_ids(rollout_responses, rollout_response_mask, idx)
+            if not response_ids:
+                continue
+            extra_info = extra_list[idx]
+            raw_prompt = raw_prompt_list[idx] if raw_prompt_list is not None else None
+            prompt_nohint = resolve_prompt_nohint(extra_info, raw_prompt)
+            if not isinstance(prompt_nohint, list):
+                continue
+            rubric = float(rollout_rubric_list[pos]) if rollout_rubric_list is not None else 0.0
+            extracted = bool(rollout_extracted_list[pos]) if rollout_extracted_list is not None else False
+            reward_val = float(rollout_reward_list[idx])
+            task_key = task_list[idx]
+            add_candidate(
+                uid,
+                {
+                    "idx": idx,
+                    "source": "rollout",
+                    "response_ids": response_ids,
+                    "reward": reward_val,
+                    "base_score": reward_val,
+                    "extracted": extracted,
+                    "rubric": rubric,
+                    "response_len": len(response_ids),
+                    "prompt_nohint": prompt_nohint,
+                    "task_key": str(task_key) if task_key is not None else "unknown",
+                },
+            )
+
+        if batch is not None and len(batch) > 0 and isinstance(reward_extra_infos, dict):
+            acr_uid_arr = batch.non_tensor_batch.get("uid")
+            acr_extra_arr = batch.non_tensor_batch.get("extra_info")
+            if acr_uid_arr is not None and acr_extra_arr is not None:
+                acr_uid_list = np.asarray(acr_uid_arr, dtype=object).tolist()
+                acr_extra_list = np.asarray(acr_extra_arr, dtype=object).tolist()
+                acr_task_arr = batch.non_tensor_batch.get("data_source")
+                if acr_task_arr is not None:
+                    acr_task_list = np.asarray(acr_task_arr, dtype=object).tolist()
+                else:
+                    acr_task_list = [None] * len(acr_uid_list)
+
+                base_scores_list = listify(reward_extra_infos.get("acr_base_score"), len(acr_uid_list))
+                rubric_scores_list = listify(reward_extra_infos.get("acr_rubric_score"), len(acr_uid_list))
+                if rubric_scores_list is None:
+                    rubric_scores_list = listify(reward_extra_infos.get("acr_rubric"), len(acr_uid_list))
+                extracted_list = listify(reward_extra_infos.get("acr_extracted"), len(acr_uid_list))
+
+                acr_responses = batch.batch.get("responses")
+                if acr_responses is not None:
+                    acr_responses = acr_responses.detach().cpu()
+                    acr_response_mask = batch.batch.get("response_mask")
+                    if acr_response_mask is not None:
+                        acr_response_mask = acr_response_mask.detach().cpu()
+                else:
+                    acr_response_mask = None
+
+                if acr_responses is not None and base_scores_list is not None:
+                    for i, uid_raw in enumerate(acr_uid_list):
+                        uid = str(uid_raw)
+                        if uid in skip_uids or self._acr_should_skip_task(acr_task_list[i], acr_extra_list[i]):
+                            continue
+                        uid_max = uid_max_rewards.get(uid)
+                        if uid_max is None or uid_max >= 1.0 - eps:
+                            continue
+                        response_ids = extract_response_ids(acr_responses, acr_response_mask, i)
+                        if not response_ids:
+                            continue
+                        base_score = base_scores_list[i]
+                        if base_score is None:
+                            continue
+                        extra_info = acr_extra_list[i]
+                        prompt_nohint = resolve_prompt_nohint(extra_info, None)
+                        if not isinstance(prompt_nohint, list):
+                            continue
+                        rubric = float(rubric_scores_list[i]) if rubric_scores_list is not None else 0.0
+                        extracted = bool(extracted_list[i]) if extracted_list is not None else False
+                        reward_val = float(base_score)
+                        task_key = acr_task_list[i]
+                        add_candidate(
+                            uid,
+                            {
+                                "idx": i,
+                                "source": "acr",
+                                "response_ids": response_ids,
+                                "reward": reward_val,
+                                "base_score": reward_val,
+                                "extracted": extracted,
+                                "rubric": rubric,
+                                "response_len": len(response_ids),
+                                "prompt_nohint": prompt_nohint,
+                                "task_key": str(task_key) if task_key is not None else "unknown",
+                            },
+                        )
+
+        total_groups = len(candidates_by_uid)
+        selected_groups = 0
+        selected_rewards: list[float] = []
+        total_pairs = 0
+        skipped_pairs = 0
+        records = []
+
+        for uid, candidates in candidates_by_uid.items():
+            chosen_pool = [c for c in candidates if c["reward"] >= threshold - eps]
+            if not chosen_pool:
+                skipped_pairs += 1
+                continue
+            rejected_pool = [c for c in candidates if c["reward"] < threshold - eps]
+
+            def pick_tiebreak(item: dict, tag: str) -> int:
+                return tiebreak(uid, item["idx"], f"{tag}-{item['source']}")
+
+            if rejected_pool:
+                chosen = max(chosen_pool, key=lambda c: (c["rubric"], pick_tiebreak(c, "chosen")))
+                rejected = max(
+                    rejected_pool, key=lambda c: (c["rubric"], c["reward"], pick_tiebreak(c, "rejected"))
+                )
+            else:
+                fallback_pool = chosen_pool
+                if len(fallback_pool) < 2:
+                    skipped_pairs += 1
+                    continue
+                chosen = max(fallback_pool, key=lambda c: (c["rubric"], pick_tiebreak(c, "chosen")))
+                rejected = min(fallback_pool, key=lambda c: (c["rubric"], pick_tiebreak(c, "rejected")))
+                if rejected["idx"] == chosen["idx"]:
+                    skipped_pairs += 1
+                    continue
+
+            record = {
+                "uid": uid,
+                "task_key": chosen["task_key"],
+                "prompt_nohint": deepcopy(chosen["prompt_nohint"]),
+                "chosen_ids": chosen["response_ids"],
+                "rejected_ids": rejected["response_ids"],
+                "chosen_meta": {
+                    "acr_score": float(chosen["reward"]),
+                    "acr_base_score": float(chosen["base_score"]) if chosen["base_score"] is not None else None,
+                    "rubric_score": float(chosen["rubric"]),
+                },
+                "rejected_meta": {
+                    "acr_score": float(rejected["reward"]),
+                    "acr_base_score": float(rejected["base_score"]) if rejected["base_score"] is not None else None,
+                    "rubric_score": float(rejected["rubric"]),
+                },
+                "pair_weight": 1.0,
+            }
+            records.append(record)
+            total_pairs += 1
+            selected_rewards.append(float(chosen["reward"]))
+            selected_groups += 1
+
+        if records:
+            self._distill_buffer_local.extend(records)
+            max_buffer = int(cfg.get("max_buffer", 0) or 0)
+            if max_buffer > 0:
+                world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+                max_local = max(1, int(math.ceil(max_buffer / world_size)))
+                if len(self._distill_buffer_local) > max_local:
+                    buffer_mode = str(cfg.get("buffer_mode", "rolling")).lower().strip()
+                    if buffer_mode == "flush":
+                        rng = np.random.default_rng(int(getattr(self, "global_steps", 0)))
+                        idxs = rng.choice(len(self._distill_buffer_local), size=max_local, replace=False)
+                        self._distill_buffer_local = [self._distill_buffer_local[i] for i in idxs]
+                    else:
+                        self._distill_buffer_local = self._distill_buffer_local[-max_local:]
 
         metrics: dict[str, float] = {}
         if total_groups > 0:
@@ -1998,12 +4030,11 @@ class RayPPOTrainer:
             metrics["distill/uid_group_total"] = float(total_groups)
         if selected_rewards:
             metrics["distill/selected_reward_mean"] = float(np.mean(selected_rewards))
-        if selected_entropy:
-            metrics["distill/entropy_proxy_mean"] = float(np.mean(selected_entropy))
-            metrics["distill/entropy_proxy_max"] = float(np.max(selected_entropy))
-        metrics["distill/selected_hint_count"] = float(hint_count)
-        metrics["distill/selected_nohint_count"] = float(nohint_count)
+        metrics["distill/dpo_pairs_added"] = float(total_pairs)
+        metrics["distill/dpo_pairs_skipped"] = float(skipped_pairs)
         metrics["distill/buffer_size_local"] = float(len(self._distill_buffer_local))
+        if skipped_task:
+            metrics["distill/skip_task"] = float(skipped_task)
         return metrics
 
     def _dedup_distill_records(self, records: list[dict]) -> list[dict]:
@@ -2026,6 +4057,24 @@ class RayPPOTrainer:
                 deduped[uid] = record
         return list(deduped.values())
 
+    def _dedup_distill_pairs(self, records: list[dict]) -> list[dict]:
+        deduped: dict[str, dict] = {}
+        for record in records:
+            uid = record.get("uid")
+            if uid is None:
+                continue
+            chosen_meta = record.get("chosen_meta") or {}
+            chosen_score = float(chosen_meta.get("acr_score", 0.0) or 0.0)
+            prev = deduped.get(uid)
+            if prev is None:
+                deduped[uid] = record
+                continue
+            prev_meta = prev.get("chosen_meta") or {}
+            prev_score = float(prev_meta.get("acr_score", 0.0) or 0.0)
+            if chosen_score > prev_score + 1e-6:
+                deduped[uid] = record
+        return list(deduped.values())
+
     def _build_distill_dataproto(
         self, records: list[dict], max_seq_len: Optional[int]
     ) -> tuple[Optional[DataProto], dict[str, float]]:
@@ -2044,10 +4093,11 @@ class RayPPOTrainer:
 
         examples = []
         rewards = []
-        entropy_vals = []
+        tiebreak_vals = []
         hint_count = 0
         nohint_count = 0
         skipped = 0
+        tiebreak_mode = str(self._distill_cfg.get("entropy_tiebreak", "mean_nll"))
 
         for record in records:
             prompt_nohint = record.get("prompt_nohint")
@@ -2083,9 +4133,9 @@ class RayPPOTrainer:
 
             examples.append({"prompt_ids": prompt_ids, "response_ids": response_ids})
             rewards.append(float(record.get("reward", 0.0)))
-            entropy = record.get("entropy_proxy")
-            if entropy is not None:
-                entropy_vals.append(float(entropy))
+            tiebreak = record.get("entropy_proxy")
+            if tiebreak is not None:
+                tiebreak_vals.append(float(tiebreak))
             if record.get("hint_used"):
                 hint_count += 1
             else:
@@ -2143,28 +4193,190 @@ class RayPPOTrainer:
         stats["sft_reward_mean"] = float(np.mean(rewards)) if rewards else 0.0
         stats["sft_hint_count"] = float(hint_count)
         stats["sft_nohint_count"] = float(nohint_count)
-        if entropy_vals:
-            stats["sft_entropy_mean"] = float(np.mean(entropy_vals))
-            stats["sft_entropy_max"] = float(np.max(entropy_vals))
+        if tiebreak_vals:
+            if tiebreak_mode in {"response_len", "length"}:
+                stats["sft_response_len_mean"] = float(np.mean(tiebreak_vals))
+                stats["sft_response_len_max"] = float(np.max(tiebreak_vals))
+            else:
+                stats["sft_entropy_mean"] = float(np.mean(tiebreak_vals))
+                stats["sft_entropy_max"] = float(np.max(tiebreak_vals))
         stats["sft_skipped"] = float(skipped)
+        return data, stats
+
+    def _build_distill_dpo_dataproto(
+        self, records: list[dict], max_seq_len: Optional[int], beta: float
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        stats: dict[str, float] = {}
+        if max_seq_len is not None:
+            try:
+                max_seq_len = int(max_seq_len)
+            except (TypeError, ValueError):
+                max_seq_len = None
+
+        prompt_limit = self.config.data.get("max_prompt_length", None)
+        response_limit = self.config.data.get("max_response_length", None)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        examples = []
+        pair_weights: list[float] = []
+        skipped = 0
+        for record in records:
+            prompt_nohint = record.get("prompt_nohint")
+            prompt_ids = self._tokenize_prompt_nohint(prompt_nohint)
+            if not prompt_ids:
+                skipped += 1
+                continue
+            if prompt_limit is not None and len(prompt_ids) > prompt_limit:
+                prompt_ids = prompt_ids[-int(prompt_limit) :]
+
+            chosen_ids = record.get("chosen_ids")
+            rejected_ids = record.get("rejected_ids")
+            if isinstance(chosen_ids, torch.Tensor):
+                chosen_ids = chosen_ids.tolist()
+            if isinstance(rejected_ids, torch.Tensor):
+                rejected_ids = rejected_ids.tolist()
+            if not chosen_ids or not rejected_ids:
+                skipped += 1
+                continue
+
+            if response_limit is not None:
+                chosen_ids = chosen_ids[: int(response_limit)]
+                rejected_ids = rejected_ids[: int(response_limit)]
+
+            if max_seq_len is not None:
+                total_len = len(prompt_ids) + max(len(chosen_ids), len(rejected_ids))
+                if total_len > max_seq_len:
+                    if len(chosen_ids) >= max_seq_len or len(rejected_ids) >= max_seq_len:
+                        chosen_ids = chosen_ids[-max_seq_len:]
+                        rejected_ids = rejected_ids[-max_seq_len:]
+                        prompt_ids = []
+                    else:
+                        keep_prompt = max_seq_len - max(len(chosen_ids), len(rejected_ids))
+                        prompt_ids = prompt_ids[-keep_prompt:]
+
+            pair_weight = float(record.get("pair_weight", 1.0))
+            examples.append({"prompt_ids": prompt_ids, "response_ids": chosen_ids})
+            examples.append({"prompt_ids": prompt_ids, "response_ids": rejected_ids})
+            pair_weights.append(pair_weight)
+
+        if not examples:
+            stats["dpo_skipped"] = float(skipped)
+            return None, stats
+
+        max_prompt_len = max(len(ex["prompt_ids"]) for ex in examples)
+        max_resp_len = max(len(ex["response_ids"]) for ex in examples)
+
+        input_ids = []
+        attention_mask = []
+        responses = []
+        response_mask = []
+
+        for ex in examples:
+            prompt_ids = ex["prompt_ids"]
+            response_ids = ex["response_ids"]
+            prompt_pad = max_prompt_len - len(prompt_ids)
+            resp_pad = max_resp_len - len(response_ids)
+
+            input_ids.append([pad_id] * prompt_pad + prompt_ids + response_ids + [pad_id] * resp_pad)
+            attention_mask.append(
+                [0] * prompt_pad + [1] * len(prompt_ids) + [1] * len(response_ids) + [0] * resp_pad
+            )
+            responses.append(response_ids + [pad_id] * resp_pad)
+            response_mask.append([1] * len(response_ids) + [0] * resp_pad)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        responses = torch.tensor(responses, dtype=torch.long)
+        response_mask = torch.tensor(response_mask, dtype=torch.long)
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        dpo_pair_weight = []
+        for weight in pair_weights:
+            dpo_pair_weight.extend([weight, weight])
+        dpo_pair_weight = torch.tensor(dpo_pair_weight, dtype=torch.float)
+
+        meta_info = {
+            "dpo_mode": True,
+            "dpo_beta": float(beta),
+            "temperature": float(self.config.actor_rollout_ref.rollout.get("temperature", 1.0)),
+            "global_token_num": attention_mask.sum(dim=-1).tolist(),
+            "dpo_pair_count": int(len(pair_weights)),
+        }
+
+        data = DataProto.from_dict(
+            tensors={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": responses,
+                "response_mask": response_mask,
+                "dpo_pair_weight": dpo_pair_weight,
+            },
+            meta_info=meta_info,
+        )
+
+        stats["dpo_pairs"] = float(len(pair_weights))
+        stats["dpo_skipped"] = float(skipped)
         return data, stats
 
     def _maybe_run_distill_sft(self, global_step: int) -> dict[str, float]:
         cfg = self._distill_cfg
         if not cfg.get("enabled", False):
             return {}
+        if str(cfg.get("method", "sft")).lower().strip() != "sft":
+            return {}
 
-        interval = int(cfg.get("interval", 0) or 0)
-        if interval <= 0:
-            return {}
-        if (global_step + 1) % interval != 0:
-            return {}
-        if global_step == self._distill_last_run_step:
-            return {}
+        buffer_mode = str(cfg.get("buffer_mode", "rolling")).lower().strip()
+        if buffer_mode == "buffer":
+            if global_step == self._distill_last_run_step:
+                return {}
+        else:
+            interval = int(cfg.get("interval", 0) or 0)
+            if interval <= 0:
+                return {}
+            if global_step % interval != 0:
+                return {}
+            if global_step == self._distill_last_run_step:
+                return {}
 
         local_records = list(self._distill_buffer_local)
+        if buffer_mode == "buffer":
+            min_buffer = int(cfg.get("min_buffer", 0) or 0)
+            if min_buffer <= 0:
+                min_buffer = int(cfg.get("batch_size", 0) or 0)
+            if min_buffer <= 0:
+                min_buffer = 1
+            if dist.is_available() and dist.is_initialized():
+                if torch.cuda.is_available():
+                    device = torch.device("cuda", torch.cuda.current_device())
+                else:
+                    device = torch.device("cpu")
+                total_count = torch.tensor([len(local_records)], device=device, dtype=torch.int64)
+                dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+                if int(total_count.item()) < min_buffer:
+                    return {}
+            elif len(local_records) < min_buffer:
+                return {}
+        keep_buffer = self._distill_source == "acr" and buffer_mode == "rolling"
         if not local_records:
             return {}
+
+        target_batch_size = cfg.get("batch_size", None)
+        if target_batch_size is None:
+            target_batch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
+            if target_batch_size is None:
+                target_batch_size = getattr(self.config.actor_rollout_ref.actor, "ppo_mini_batch_size", None)
+        if buffer_mode == "buffer":
+            target_batch_size = None
+        if target_batch_size is not None:
+            try:
+                target_batch_size = int(target_batch_size)
+            except (TypeError, ValueError):
+                target_batch_size = None
+            if target_batch_size is not None and target_batch_size <= 0:
+                target_batch_size = None
 
         if dist.is_available() and dist.is_initialized():
             gathered = [None for _ in range(dist.get_world_size())]
@@ -2177,74 +4389,36 @@ class RayPPOTrainer:
                 records = all_records
                 if cfg.get("dedup_by_uid", True):
                     records = self._dedup_distill_records(records)
-                records.sort(
-                    key=lambda r: (
-                        -float(r.get("reward", 0.0)),
-                        -(
-                            float(r.get("entropy_proxy"))
-                            if r.get("entropy_proxy") is not None
-                            else float("-inf")
-                        ),
-                        str(r.get("uid", "")),
-                    )
-                )
-                max_buffer = int(cfg.get("max_buffer", 0) or 0)
-                if max_buffer > 0:
-                    records = records[:max_buffer]
+                pool_size = len(records)
+                rng = np.random.default_rng(int(global_step))
+                if target_batch_size is not None and len(records) > target_batch_size:
+                    idxs = rng.choice(len(records), size=target_batch_size, replace=False)
+                    records = [records[i] for i in idxs]
+                payload = {"records": records, "pool_size": pool_size}
             else:
-                records = None
-            obj_list = [records]
+                payload = None
+            obj_list = [payload]
             dist.broadcast_object_list(obj_list, src=0)
-            records = obj_list[0] or []
+            payload = obj_list[0] or {}
+            records = payload.get("records") or []
+            pool_size = int(payload.get("pool_size") or 0)
         else:
             records = local_records
             if cfg.get("dedup_by_uid", True):
                 records = self._dedup_distill_records(records)
-            records.sort(
-                key=lambda r: (
-                    -float(r.get("reward", 0.0)),
-                    -(
-                        float(r.get("entropy_proxy"))
-                        if r.get("entropy_proxy") is not None
-                        else float("-inf")
-                    ),
-                    str(r.get("uid", "")),
-                )
-            )
-            max_buffer = int(cfg.get("max_buffer", 0) or 0)
-            if max_buffer > 0:
-                records = records[:max_buffer]
+            pool_size = len(records)
+            rng = np.random.default_rng(int(global_step))
+            if target_batch_size is not None and len(records) > target_batch_size:
+                idxs = rng.choice(len(records), size=target_batch_size, replace=False)
+                records = [records[i] for i in idxs]
 
         if not records:
-            self._distill_buffer_local = []
+            if not keep_buffer:
+                self._distill_buffer_local = []
             return {}
 
         dp_size = self._get_actor_dp_size()
-        drop_last = bool(cfg.get("drop_last", True))
-        sft_batch_size = cfg.get("batch_size", None)
-        if sft_batch_size is None:
-            sft_batch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
-            if sft_batch_size is None:
-                sft_batch_size = getattr(self.config.actor_rollout_ref.actor, "ppo_mini_batch_size", None)
-        if sft_batch_size is not None:
-            sft_batch_size = int(sft_batch_size)
-            if sft_batch_size <= 0:
-                sft_batch_size = None
-            elif len(records) < sft_batch_size:
-                sft_batch_size = len(records)
-        if sft_batch_size is None and records:
-            sft_batch_size = len(records)
-
-        divisor = dp_size
-        if sft_batch_size is not None and sft_batch_size > 0:
-            divisor = math.lcm(dp_size, sft_batch_size)
-
-        if drop_last and divisor > 1:
-            usable = (len(records) // divisor) * divisor
-            records = records[:usable]
-            if not records:
-                self._distill_buffer_local = []
-                return {}
+        sampled_count = len(records)
 
         max_seq_len = cfg.get("max_seq_len", None)
         if max_seq_len is None:
@@ -2259,19 +4433,198 @@ class RayPPOTrainer:
 
         data, stats = self._build_distill_dataproto(records, max_seq_len)
         if data is None:
-            self._distill_buffer_local = []
+            if not keep_buffer:
+                self._distill_buffer_local = []
             return {}
 
-        if sft_batch_size is not None and sft_batch_size > 0:
-            data.meta_info["sft_mini_batch_size"] = int(sft_batch_size)
+        divisor = max(1, dp_size)
+        pad_size = 0
+        if divisor > 1:
+            data, pad_size = pad_dataproto_to_divisor(data, divisor)
+
+        data.meta_info["sft_mini_batch_size"] = int(len(data))
         if max_seq_len is not None:
             data.meta_info["sft_max_token_len"] = int(max_seq_len)
+        lr_scale = cfg.get("lr_scale", 1.0)
+        if lr_scale is not None:
+            try:
+                lr_scale = float(lr_scale)
+            except (TypeError, ValueError):
+                lr_scale = 1.0
+            data.meta_info["sft_lr_scale"] = lr_scale
         data.meta_info["sft_epochs"] = 1
         data.meta_info["sft_shuffle"] = True
 
+        actor_output = self.actor_rollout_wg.update_actor(data)
+        actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+
+        metrics: dict[str, float] = {
+            "distill/ran": 1.0,
+            "distill/buffer_size_global": float(pool_size),
+            "distill/sft_sampled_count": float(sampled_count),
+        }
+        for key, val in stats.items():
+            metrics[f"distill/{key}"] = float(val)
+        for key, val in actor_metrics.items():
+            mapped = key[len("actor/") :] if key.startswith("actor/") else key
+            metrics[f"distill_sft/{mapped}"] = float(val)
+
+        if not keep_buffer:
+            self._distill_buffer_local = []
+        self._distill_last_run_step = global_step
+        return metrics
+
+    def _maybe_run_distill_dpo(self, global_step: int) -> dict[str, float]:
+        cfg = self._distill_cfg
+        if not cfg.get("enabled", False):
+            return {}
+        if str(cfg.get("method", "sft")).lower().strip() != "dpo":
+            return {}
+
+        interval = int(cfg.get("interval", 0) or 0)
+        if interval <= 0:
+            return {}
+            if global_step % interval != 0:
+                return {}
+            if global_step == self._distill_last_run_step:
+                return {}
+
+        local_records = list(self._distill_buffer_local)
+        if not local_records:
+            return {}
+
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, local_records)
+            all_records: list[dict] = []
+            for chunk in gathered:
+                if chunk:
+                    all_records.extend(chunk)
+            if dist.get_rank() == 0:
+                records = all_records
+                if cfg.get("dedup_by_uid", False):
+                    records = self._dedup_distill_pairs(records)
+                records.sort(
+                    key=lambda r: (
+                        -float((r.get("chosen_meta") or {}).get("acr_score", 0.0)),
+                        str(r.get("uid", "")),
+                    )
+                )
+                max_buffer = int(cfg.get("max_buffer", 0) or 0)
+                if max_buffer > 0:
+                    records = records[:max_buffer]
+            else:
+                records = None
+            obj_list = [records]
+            dist.broadcast_object_list(obj_list, src=0)
+            records = obj_list[0] or []
+        else:
+            records = local_records
+            if cfg.get("dedup_by_uid", False):
+                records = self._dedup_distill_pairs(records)
+            records.sort(
+                key=lambda r: (
+                    -float((r.get("chosen_meta") or {}).get("acr_score", 0.0)),
+                    str(r.get("uid", "")),
+                )
+            )
+            max_buffer = int(cfg.get("max_buffer", 0) or 0)
+            if max_buffer > 0:
+                records = records[:max_buffer]
+
+        if not records:
+            self._distill_buffer_local = []
+            return {}
+
+        dpo_cfg = cfg.get("dpo", {})
+        if not isinstance(dpo_cfg, dict):
+            dpo_cfg = {}
+        beta = dpo_cfg.get("beta", 0.1)
+        try:
+            beta = float(beta)
+        except (TypeError, ValueError):
+            beta = 0.1
+
+        dp_size = self._get_actor_dp_size()
+        drop_last = bool(cfg.get("drop_last", True))
+
+        dpo_batch_size = cfg.get("batch_size", None)
+        if dpo_batch_size is not None:
+            dpo_batch_size = int(dpo_batch_size)
+            if dpo_batch_size <= 0:
+                dpo_batch_size = None
+            elif len(records) < dpo_batch_size:
+                dpo_batch_size = len(records)
+        if dpo_batch_size is None and records:
+            dpo_batch_size = len(records)
+
+        pair_divisor = max(1, math.lcm(dp_size, 2) // 2)
+        if dpo_batch_size is not None and dpo_batch_size > 0:
+            pair_divisor = math.lcm(pair_divisor, dpo_batch_size)
+
+        if drop_last and pair_divisor > 1:
+            usable_pairs = (len(records) // pair_divisor) * pair_divisor
+            records = records[:usable_pairs]
+            if not records:
+                self._distill_buffer_local = []
+                return {}
+
+        max_seq_len = cfg.get("max_seq_len", None)
+        if max_seq_len is None:
+            max_prompt = self.config.data.get("max_prompt_length", None)
+            max_response = self.config.data.get("max_response_length", None)
+            if max_prompt is not None and max_response is not None:
+                max_seq_len = int(max_prompt) + int(max_response)
+
+        data, stats = self._build_distill_dpo_dataproto(records, max_seq_len, beta=beta)
+        if data is None or len(data) == 0:
+            self._distill_buffer_local = []
+            return {}
+
+        lr_scale = cfg.get("lr_scale", 1.0)
+        try:
+            lr_scale = float(lr_scale)
+        except (TypeError, ValueError):
+            lr_scale = 1.0
+        data.meta_info["dpo_lr_scale"] = lr_scale
+        data.meta_info["dpo_epochs"] = 1
+        data.meta_info["dpo_shuffle"] = False
+        dpo_mini_batch_size = int(dpo_batch_size) if dpo_batch_size is not None else len(records)
+        dpo_mini_batch_size = max(1, dpo_mini_batch_size) * 2
+        if dpo_mini_batch_size % 2 != 0:
+            dpo_mini_batch_size = max(2, dpo_mini_batch_size - 1)
+        data.meta_info["dpo_mini_batch_size"] = dpo_mini_batch_size
+
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if isinstance(actor_cfg, DictConfig):
+            micro_bsz = actor_cfg.get("ppo_micro_batch_size_per_gpu", None)
+            if micro_bsz is None:
+                micro_bsz = actor_cfg.get("ppo_mini_batch_size", None)
+        else:
+            micro_bsz = getattr(actor_cfg, "ppo_micro_batch_size_per_gpu", None)
+            if micro_bsz is None:
+                micro_bsz = getattr(actor_cfg, "ppo_mini_batch_size", None)
+        if micro_bsz is None:
+            micro_bsz = dpo_mini_batch_size
+        micro_bsz = int(micro_bsz)
+        if micro_bsz % 2 != 0:
+            micro_bsz = max(2, micro_bsz - 1)
+        if micro_bsz > dpo_mini_batch_size:
+            micro_bsz = dpo_mini_batch_size
+        data.meta_info["dpo_micro_batch_size"] = int(micro_bsz)
+
+        ref_worker = self._get_dpo_ref_worker()
+
+        divisor = math.lcm(dp_size, 2)
         pad_size = 0
         if not drop_last and divisor > 1:
             data, pad_size = pad_dataproto_to_divisor(data, divisor)
+
+        ref_batch, ref_pad = pad_dataproto_to_divisor(data, dp_size)
+        ref_log_prob = ref_worker.compute_ref_log_prob(ref_batch)
+        if ref_pad:
+            ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=ref_pad)
+        data = data.union(ref_log_prob)
 
         actor_output = self.actor_rollout_wg.update_actor(data)
         actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -2284,29 +4637,88 @@ class RayPPOTrainer:
             metrics[f"distill/{key}"] = float(val)
         for key, val in actor_metrics.items():
             mapped = key[len("actor/") :] if key.startswith("actor/") else key
-            metrics[f"distill_sft/{mapped}"] = float(val)
+            metrics[f"distill_dpo/{mapped}"] = float(val)
+        metrics["distill_dpo/beta"] = float(beta)
 
         self._distill_buffer_local = []
         self._distill_last_run_step = global_step
         return metrics
 
-    def _run_acr_phase(self, acr_batch: Optional[DataProto], timing_raw: dict) -> dict[str, float]:
-        if not self._acr_enabled or acr_batch is None or len(acr_batch) == 0:
+    def _get_dpo_ref_worker(self):
+        if not self.use_reference_policy:
+            raise RuntimeError("DPO distill requires a reference policy worker. Enable ref policy for DPO runs.")
+        if self.ref_in_actor:
+            return self.actor_rollout_wg
+        return self.ref_policy_wg
+
+    def _run_acr_phase(
+        self,
+        acr_batch: Optional[DataProto],
+        timing_raw: dict,
+        *,
+        rollout_batch: Optional[DataProto] = None,
+        rollout_reward_scalar: Optional[torch.Tensor] = None,
+        rollout_uid_max_rewards: Optional[dict[str, float]] = None,
+    ) -> dict[str, float]:
+        if not self._acr_enabled:
             return {}
+
+        distill_method = str(self._distill_cfg.get("method", "sft")).lower().strip()
+        if acr_batch is None or len(acr_batch) == 0:
+            metrics: dict[str, float] = {}
+            if self._distill_source == "acr" and distill_method == "dpo":
+                distill_metrics = self._collect_distill_candidates(
+                    batch=acr_batch,
+                    reward_scalar=None,
+                    reward_threshold_scalar=None,
+                    reward_extra_infos=None,
+                    rollout_batch=rollout_batch,
+                    rollout_reward_scalar=rollout_reward_scalar,
+                    uid_max_rewards=rollout_uid_max_rewards,
+                )
+                if distill_metrics:
+                    metrics.update({f"acr_{k}": float(v) for k, v in distill_metrics.items()})
+
+                distill_metrics = self._maybe_run_distill_dpo(self.global_steps)
+                if distill_metrics:
+                    metrics.update({f"acr_{k}": float(v) for k, v in distill_metrics.items()})
+            return metrics
 
         metrics: dict[str, float] = {}
 
+        rollout_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        actor_divisor = self.actor_rollout_wg.world_size
+
         acr_gen_batch = self._get_gen_batch(acr_batch)
         acr_gen_batch.meta_info["global_steps"] = self.global_steps
+        if self._acr_ema_enabled:
+            if self.async_rollout_mode:
+                if not self._acr_ema_warned_async:
+                    print("ACR ema_teacher disabled for async rollout; using actor weights.")
+                    self._acr_ema_warned_async = True
+            else:
+                acr_gen_batch.meta_info["acr_use_ema_teacher"] = True
+        sampling_kwargs = dict(self._acr_rollout_sampling) if self._acr_rollout_sampling else {}
+        if sampling_kwargs:
+            for key, value in sampling_kwargs.items():
+                if value is None:
+                    continue
+                acr_gen_batch.meta_info[key] = value
         acr_gen_batch = acr_gen_batch.repeat(repeat_times=self._acr_rollout_n, interleave=True)
 
         with marked_timer("acr_gen", timing_raw, color="magenta"):
+            acr_gen_batch_padded, pad_size = pad_dataproto_to_divisor(acr_gen_batch, rollout_divisor)
             if not self.async_rollout_mode:
-                acr_gen_output = self.actor_rollout_wg.generate_sequences(acr_gen_batch)
+                acr_gen_output_padded = self.actor_rollout_wg.generate_sequences(acr_gen_batch_padded)
             else:
-                acr_gen_output = self.async_rollout_manager.generate_sequences(acr_gen_batch)
-            timing_raw.update(acr_gen_output.meta_info.get("timing", {}))
-            acr_gen_output.meta_info.pop("timing", None)
+                acr_gen_output_padded = self.async_rollout_manager.generate_sequences(acr_gen_batch_padded)
+            timing_raw.update(acr_gen_output_padded.meta_info.get("timing", {}))
+            acr_gen_output_padded.meta_info.pop("timing", None)
+            acr_gen_output = unpad_dataproto(acr_gen_output_padded, pad_size=pad_size)
 
         acr_batch = acr_batch.repeat(repeat_times=self._acr_rollout_n, interleave=True)
         acr_batch = acr_batch.union(acr_gen_output)
@@ -2315,7 +4727,12 @@ class RayPPOTrainer:
             acr_batch.batch["response_mask"] = compute_response_mask(acr_batch)
 
         if self.config.trainer.balance_batch:
-            self._balance_batch(acr_batch, metrics=metrics, logging_prefix="acr_seqlen")
+            if len(acr_batch) % actor_divisor == 0:
+                self._balance_batch(acr_batch, metrics=metrics, logging_prefix="acr_seqlen")
+            else:
+                metrics["acr/balance_skipped"] = 1.0
+                metrics["acr/balance_skip_size"] = float(len(acr_batch))
+                metrics["acr/balance_skip_world_size"] = float(actor_divisor)
 
         acr_batch.meta_info["global_token_num"] = torch.sum(acr_batch.batch["attention_mask"], dim=-1).tolist()
 
@@ -2339,6 +4756,10 @@ class RayPPOTrainer:
         elif reward_tensor_raw.dim() == 1:
             reward_scalar_raw = reward_tensor_raw
 
+        do_acr_update = bool(self._acr_update_actor) or (
+            self.use_critic and bool(self._acr_cfg.get("update_critic", False))
+        )
+
         reward_threshold_scalar = None
         base_scores = reward_extra_infos_dict.get("acr_base_score")
         if base_scores is not None:
@@ -2349,13 +4770,17 @@ class RayPPOTrainer:
             if base_scores_arr is not None and base_scores_arr.size == len(acr_batch):
                 reward_threshold_scalar = torch.tensor(base_scores_arr)
 
-        reward_tensor = reward_tensor_raw
-        if self._acr_weight != 1.0:
-            reward_tensor = reward_tensor * float(self._acr_weight)
-        acr_batch.batch["token_level_scores"] = reward_tensor
+        if do_acr_update:
+            reward_tensor = reward_tensor_raw
+            if self._acr_weight != 1.0:
+                reward_tensor = reward_tensor * float(self._acr_weight)
+            acr_batch.batch["token_level_scores"] = reward_tensor
 
         with marked_timer("acr_old_log_prob", timing_raw, color="blue"):
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(acr_batch)
+            acr_batch_lp, pad_size = pad_dataproto_to_divisor(acr_batch, actor_divisor)
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(acr_batch_lp)
+            if pad_size:
+                old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
             entropys = old_log_prob.batch["entropys"]
             response_masks = acr_batch.batch["response_mask"]
             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -2371,65 +4796,95 @@ class RayPPOTrainer:
             reward_extra_infos=reward_extra_infos_dict,
         )
 
-        if self.use_reference_policy:
-            with marked_timer("acr_ref", timing_raw, color="olive"):
-                if not self.ref_in_actor:
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(acr_batch)
+        if do_acr_update:
+            if self.use_reference_policy:
+                with marked_timer("acr_ref", timing_raw, color="olive"):
+                    acr_batch_ref, pad_size = pad_dataproto_to_divisor(acr_batch, actor_divisor)
+                    if not self.ref_in_actor:
+                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(acr_batch_ref)
+                    else:
+                        ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(acr_batch_ref)
+                    if pad_size:
+                        ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size)
+                    acr_batch = acr_batch.union(ref_log_prob)
+
+            if self.use_critic:
+                with marked_timer("acr_values", timing_raw, color="cyan"):
+                    acr_batch_val, pad_size = pad_dataproto_to_divisor(acr_batch, actor_divisor)
+                    values = self.critic_wg.compute_values(acr_batch_val)
+                    if pad_size:
+                        values = unpad_dataproto(values, pad_size=pad_size)
+                    acr_batch = acr_batch.union(values)
+
+            with marked_timer("acr_adv", timing_raw, color="brown"):
+                if self.config.algorithm.use_kl_in_reward:
+                    acr_batch, kl_metrics = apply_kl_penalty(
+                        acr_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                    )
+                    for key, val in kl_metrics.items():
+                        metrics[f"acr/{key}"] = float(val)
                 else:
-                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(acr_batch)
-                acr_batch = acr_batch.union(ref_log_prob)
+                    acr_batch.batch["token_level_rewards"] = acr_batch.batch["token_level_scores"]
 
-        if self.use_critic:
-            with marked_timer("acr_values", timing_raw, color="cyan"):
-                values = self.critic_wg.compute_values(acr_batch)
-                acr_batch = acr_batch.union(values)
-
-        with marked_timer("acr_adv", timing_raw, color="brown"):
-            if self.config.algorithm.use_kl_in_reward:
-                acr_batch, kl_metrics = apply_kl_penalty(
-                    acr_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                acr_batch = compute_advantage(
+                    acr_batch,
+                    adv_estimator=self.config.algorithm.adv_estimator,
+                    gamma=self.config.algorithm.gamma,
+                    lam=self.config.algorithm.lam,
+                    num_repeat=self._acr_rollout_n,
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    config=self.config.algorithm,
                 )
-                for key, val in kl_metrics.items():
+
+            if self.use_critic and self._acr_cfg.get("update_critic", False):
+                with marked_timer("acr_update_critic", timing_raw, color="pink"):
+                    acr_batch_update, _ = pad_dataproto_to_divisor(acr_batch, actor_divisor)
+                    critic_output = self.critic_wg.update_critic(acr_batch_update)
+                critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                for key, val in critic_output_metrics.items():
                     metrics[f"acr/{key}"] = float(val)
-            else:
-                acr_batch.batch["token_level_rewards"] = acr_batch.batch["token_level_scores"]
 
-            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
-            acr_batch = compute_advantage(
-                acr_batch,
-                adv_estimator=self.config.algorithm.adv_estimator,
-                gamma=self.config.algorithm.gamma,
-                lam=self.config.algorithm.lam,
-                num_repeat=self._acr_rollout_n,
-                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                config=self.config.algorithm,
-            )
+            if self._acr_update_actor:
+                with marked_timer("acr_update_actor", timing_raw, color="red"):
+                    acr_batch_update, _ = pad_dataproto_to_divisor(acr_batch, actor_divisor)
+                    acr_batch_update.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                    actor_output = self.actor_rollout_wg.update_actor(acr_batch_update)
+                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                for key, val in actor_output_metrics.items():
+                    metrics[f"acr/{key}"] = float(val)
+        else:
+            metrics["acr/ppo_update_skipped"] = 1.0
 
-        if self.use_critic and self._acr_cfg.get("update_critic", False):
-            with marked_timer("acr_update_critic", timing_raw, color="pink"):
-                critic_output = self.critic_wg.update_critic(acr_batch)
-            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-            for key, val in critic_output_metrics.items():
-                metrics[f"acr/{key}"] = float(val)
-
-        with marked_timer("acr_update_actor", timing_raw, color="red"):
-            acr_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-            actor_output = self.actor_rollout_wg.update_actor(acr_batch)
-        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-        for key, val in actor_output_metrics.items():
-            metrics[f"acr/{key}"] = float(val)
-
-        if reward_scalar_raw is not None and self._distill_source == "acr":
-            distill_metrics = self._collect_distill_candidates(
-                batch=acr_batch,
-                reward_scalar=reward_scalar_raw,
-                reward_threshold_scalar=reward_threshold_scalar,
-            )
+        if self._distill_source == "acr":
+            distill_metrics = None
+            if distill_method == "dpo":
+                distill_metrics = self._collect_distill_candidates(
+                    batch=acr_batch,
+                    reward_scalar=reward_scalar_raw,
+                    reward_threshold_scalar=reward_threshold_scalar,
+                    reward_extra_infos=reward_extra_infos_dict,
+                    rollout_batch=rollout_batch,
+                    rollout_reward_scalar=rollout_reward_scalar,
+                    uid_max_rewards=rollout_uid_max_rewards,
+                )
+            elif reward_scalar_raw is not None:
+                distill_metrics = self._collect_distill_candidates(
+                    batch=acr_batch,
+                    reward_scalar=reward_scalar_raw,
+                    reward_threshold_scalar=reward_threshold_scalar,
+                    reward_extra_infos=reward_extra_infos_dict,
+                )
             if distill_metrics:
                 metrics.update({f"acr_{k}": float(v) for k, v in distill_metrics.items()})
 
         if self._distill_source == "acr":
-            distill_metrics = self._maybe_run_distill_sft(self.global_steps)
+            if distill_method == "dpo":
+                with marked_timer("acr_distill_dpo", timing_raw, color="green"):
+                    distill_metrics = self._maybe_run_distill_dpo(self.global_steps)
+            else:
+                with marked_timer("acr_distill_sft", timing_raw, color="green"):
+                    distill_metrics = self._maybe_run_distill_sft(self.global_steps)
             if distill_metrics:
                 metrics.update({f"acr_{k}": float(v) for k, v in distill_metrics.items()})
 
@@ -2457,6 +4912,7 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self._maybe_reset_acr_ema_teacher()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -2495,6 +4951,7 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                step_full_start = time.perf_counter()
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2504,6 +4961,7 @@ class RayPPOTrainer:
                     )
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                distill_method = str(self._distill_cfg.get("method", "sft")).lower().strip()
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -2511,9 +4969,12 @@ class RayPPOTrainer:
                 )
                 acr_batch = None
                 if self._acr_enabled:
-                    acr_batch, acr_build_metrics = self._build_acr_batch(batch)
+                    with marked_timer("acr_build", timing_raw, color="magenta"):
+                        acr_batch, acr_build_metrics = self._build_acr_batch(batch)
                     if acr_build_metrics:
                         metrics.update(acr_build_metrics)
+                acr_hard_uids = None
+                acr_uid_max_rewards = None
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -2642,6 +5103,20 @@ class RayPPOTrainer:
                             reward_scalar = reward_tensor.max(dim=-1).values
                         elif reward_tensor.dim() == 1:
                             reward_scalar = reward_tensor
+
+                        if self._acr_enabled:
+                            if self._distill_source == "acr" and distill_method == "dpo":
+                                acr_uid_max_rewards, acr_uid_metrics = self._compute_uid_max_rewards(
+                                    batch=batch, reward_scalar=reward_scalar
+                                )
+                                if acr_uid_metrics:
+                                    metrics.update(acr_uid_metrics)
+                            else:
+                                acr_hard_uids, acr_hard_metrics = self._compute_acr_hard_uids(
+                                    batch=batch, reward_scalar=reward_scalar
+                                )
+                                if acr_hard_metrics:
+                                    metrics.update(acr_hard_metrics)
 
                         # Optional: update adaptive label-hint curriculum on the training dataset.
                         if hasattr(self.train_dataset, "update_option_curriculum_from_rollout"):
@@ -2840,9 +5315,66 @@ class RayPPOTrainer:
                                 metrics.update(distill_metrics)
 
                         if self._acr_enabled:
-                            acr_metrics = self._run_acr_phase(acr_batch, timing_raw)
-                            if acr_metrics:
-                                metrics.update(acr_metrics)
+                            if self._distill_source == "acr" and distill_method == "dpo":
+                                if acr_uid_max_rewards is not None:
+                                    acr_batch, acr_dpo_filter_metrics = self._filter_acr_batch_by_uid_max_reward(
+                                        acr_batch, acr_uid_max_rewards
+                                    )
+                                    if acr_dpo_filter_metrics:
+                                        metrics.update(acr_dpo_filter_metrics)
+                            else:
+                                if acr_hard_uids is not None:
+                                    acr_batch, acr_hard_filter_metrics = self._filter_acr_batch_by_uids(
+                                        acr_batch, acr_hard_uids
+                                    )
+                                    if acr_hard_filter_metrics:
+                                        metrics.update(acr_hard_filter_metrics)
+                            defer_acr = (
+                                self._acr_defer_generation
+                                and self._distill_source == "acr"
+                                and distill_method == "sft"
+                            )
+                            if defer_acr:
+                                if acr_batch is not None and len(acr_batch) > 0:
+                                    self._acr_prompt_buffer_local.append(acr_batch)
+                                buffer_batches = len(self._acr_prompt_buffer_local)
+                                buffer_size = sum(len(buf) for buf in self._acr_prompt_buffer_local)
+                                metrics["acr/defer_buffer_batches"] = float(buffer_batches)
+                                metrics["acr/defer_buffer_size"] = float(buffer_size)
+                                interval = int(self._distill_cfg.get("interval", 0) or 0)
+                                buffer_mode = str(self._distill_cfg.get("buffer_mode", "rolling")).lower().strip()
+                                flush_now = bool(interval > 0 and buffer_mode != "buffer")
+                                if flush_now:
+                                    flush_now = (self.global_steps % interval) == 0
+                                if flush_now and buffer_batches > 0:
+                                    metrics["acr/defer_flush"] = 1.0
+                                    metrics["acr/defer_flush_size"] = float(buffer_size)
+                                    if buffer_batches == 1:
+                                        acr_flush_batch = self._acr_prompt_buffer_local[0]
+                                    else:
+                                        acr_flush_batch = DataProto.concat(self._acr_prompt_buffer_local)
+                                    self._acr_prompt_buffer_local = []
+                                    acr_metrics = self._run_acr_phase(
+                                        acr_flush_batch,
+                                        timing_raw,
+                                        rollout_batch=batch,
+                                        rollout_reward_scalar=reward_scalar,
+                                        rollout_uid_max_rewards=acr_uid_max_rewards,
+                                    )
+                                    if acr_metrics:
+                                        metrics.update(acr_metrics)
+                                else:
+                                    metrics["acr/defer_flush"] = 0.0
+                            else:
+                                acr_metrics = self._run_acr_phase(
+                                    acr_batch,
+                                    timing_raw,
+                                    rollout_batch=batch,
+                                    rollout_reward_scalar=reward_scalar,
+                                    rollout_uid_max_rewards=acr_uid_max_rewards,
+                                )
+                                if acr_metrics:
+                                    metrics.update(acr_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -2871,6 +5403,7 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                             )
 
+                val_metrics = None
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -2878,7 +5411,7 @@ class RayPPOTrainer:
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
+                        val_metrics = self._validate()
                         extra_val_metrics = self._run_extra_validations()
                         if extra_val_metrics:
                             val_metrics.update(extra_val_metrics)
@@ -2898,13 +5431,70 @@ class RayPPOTrainer:
                 # 2. It's the last training step.
                 # 3. The current step number is a multiple of the save frequency.
                 # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                if self.config.trainer.save_freq > 0 and (
+                save_due = self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-                ):
-                    if esi_close_to_expiration:
-                        print("Force saving checkpoint: ESI instance expiration approaching.")
-                    with marked_timer("save_checkpoint", timing_raw, color="green"):
-                        self._save_checkpoint()
+                )
+                if save_due:
+                    save_best_only = bool(self.config.trainer.get("save_best_only", False))
+                    if save_best_only:
+                        saved_best = False
+                        if val_metrics is not None:
+                            metric_key = str(
+                                self.config.trainer.get("save_best_metric", "val-core/global-val/reward/mean")
+                            )
+                            metric_mode = str(self.config.trainer.get("save_best_mode", "max")).lower()
+                            metric_val = None
+                            if isinstance(val_metrics, dict):
+                                metric_val = val_metrics.get(metric_key)
+                            if metric_val is None:
+                                metric_val = metrics.get(metric_key)
+                            if metric_val is None:
+                                print(f"Skip save_best_only: metric {metric_key} not found.")
+                            else:
+                                try:
+                                    metric_val = float(metric_val)
+                                except (TypeError, ValueError):
+                                    metric_val = None
+                                if metric_val is None:
+                                    print(f"Skip save_best_only: metric {metric_key} is not numeric.")
+                                else:
+                                    improved = False
+                                    if self._best_val_metric is None:
+                                        improved = True
+                                    elif metric_mode in {"min", "lower"}:
+                                        improved = metric_val < (self._best_val_metric - 1e-12)
+                                    else:
+                                        improved = metric_val > (self._best_val_metric + 1e-12)
+                                    if improved:
+                                        self._best_val_metric = metric_val
+                                        self._best_val_step = self.global_steps
+                                        best_dir = str(self.config.trainer.get("save_best_dir", "best"))
+                                        if esi_close_to_expiration:
+                                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                            self._save_checkpoint(
+                                                folder_name=best_dir,
+                                                update_tracker=False,
+                                                purge_dir=True,
+                                                skip_ckpt_rotation=True,
+                                            )
+                                        saved_best = True
+                        if is_last_step:
+                            if esi_close_to_expiration and not saved_best:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                last_dir = str(self.config.trainer.get("save_last_dir", "last"))
+                                self._save_checkpoint(
+                                    folder_name=last_dir,
+                                    update_tracker=True,
+                                    purge_dir=True,
+                                    skip_ckpt_rotation=True,
+                                )
+                    else:
+                        if esi_close_to_expiration:
+                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
@@ -2919,6 +5509,7 @@ class RayPPOTrainer:
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
+                timing_raw["step_full"] = time.perf_counter() - step_full_start
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)

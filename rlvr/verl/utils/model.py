@@ -622,7 +622,11 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -660,11 +664,11 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 
 
 def get_hf_auto_model_class(hf_config):
-    from transformers import (
-        AutoModel,
-        AutoModelForCausalLM,
-        AutoModelForVision2Seq,
-    )
+    from transformers import AutoModel, AutoModelForCausalLM
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
     has_remote_code = hasattr(hf_config, "auto_map") and any(
         hf_config.architectures[0] in val for val in hf_config.auto_map.values()

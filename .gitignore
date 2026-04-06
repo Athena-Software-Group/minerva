@@ -220,16 +220,12 @@ minerva/analysis/results/
 
 # RLVR local datasets (keep converters + curated CTI outputs tracked)
 rlvr/mydata/**
-!rlvr/mydata/cti/
-!rlvr/mydata/cti/**
-!rlvr/mydata/cti-in/
-!rlvr/mydata/cti-in/**
 !rlvr/mydata/minerva_base/
 !rlvr/mydata/minerva_base/**
-!rlvr/mydata/minerva_lhc/
-!rlvr/mydata/minerva_lhc/**
 !rlvr/mydata/athena/
 !rlvr/mydata/athena/**
+!rlvr/mydata/sft/
+!rlvr/mydata/sft/**
 !rlvr/mydata/data_prepare/
 !rlvr/mydata/data_prepare/**
 rlvr/mydata/data_prepare/**/__pycache__/
@@ -237,3 +233,4 @@ rlvr/mydata/data_prepare/**/*.pyc
 rlvr/outputs/
 rlvr/checkpoints/
 rlvr/wandb/
+wandb/

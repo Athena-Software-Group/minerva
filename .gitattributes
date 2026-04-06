@@ -1,6 +1,7 @@
-# LFS tracking (only keep VeRL training artifacts here)
-rlvr/mydata/cti/** filter=lfs diff=lfs merge=lfs -text
+# LFS tracking for the runtime datasets kept in this repo.
+dataset/label_details/** filter=lfs diff=lfs merge=lfs -text
+dataset/minerva_base_split/** filter=lfs diff=lfs merge=lfs -text
+dataset/models/** filter=lfs diff=lfs merge=lfs -text
 rlvr/mydata/minerva_base/** filter=lfs diff=lfs merge=lfs -text
-rlvr/mydata/minerva_lhc/** filter=lfs diff=lfs merge=lfs -text
 rlvr/mydata/athena/** filter=lfs diff=lfs merge=lfs -text
-dataset/** filter=lfs diff=lfs merge=lfs -text
+rlvr/mydata/sft/** filter=lfs diff=lfs merge=lfs -text

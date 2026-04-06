@@ -32,16 +32,19 @@ RESAMPLE_COUNTS: Dict[str, int] = {
     "cve_to_attack_secondary_impact": 74,
     "sigma_to_attack_technique": 1000,
     "sigma_to_attack_tactics": 1000,
-    "scenario_to_technique": 7500,
-    "scenario_to_tactics": 1000,
-    "scenario_to_mitigations": 7500,
-    "cve_to_cwe": 8000,
+    "art_to_attack_technique": 1000,
+    "sentinel_to_attack_technique": 1000,
+    "splunk_to_attack_technique": 300,
+    "scenario_to_technique": 8000,
+    "scenario_to_tactics": 2000,
+    "scenario_to_mitigations": 8000,
+    "cve_to_cwe": 6916,
     "cve_to_cvss_v31": 2000,
-    "cve_to_cvss_v40": 500,
+    "cve_to_cvss_v40": 0,
     "capec_example_to_capec": 380,
     "capec_example_to_cwe": 196,
-    "capec_example_to_attack": 144,
-    "threat_actor_mcq": 3211,
+    "capec_example_to_attack": 0,
+    "threat_actor": 839,
 }
 RESAMPLE_SEED = 1337
 
@@ -151,6 +154,21 @@ def _dedupe_jsonl(path: Path) -> tuple[int, int]:
     return len(rows), removed
 
 
+def _copy_external_task(src: Path, dest: Path, logger=None) -> int:
+    if not src.exists():
+        if logger is not None:
+            logger.warning("Missing external task file: %s", src)
+        return 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    count = 0
+    for _ in _iter_jsonl(dest):
+        count += 1
+    if logger is not None:
+        logger.info("Copied external task %s -> %s (%d rows)", src.name, dest, count)
+    return count
+
+
 def _replace_minerva_path(path: str, output_root: str) -> str:
     if not path:
         return path
@@ -193,8 +211,16 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
         prefer_ts_fn=lambda r: r.get("published_date") or r.get("last_modified_date"),
     )
 
-    logger.info("Loading CAPEC bundle")
-    capec_data = load_capec_bundle(cfg.get("CAPEC", {}), logger=logger)
+    capec_needed = any(
+        RESAMPLE_COUNTS.get(key, 0) > 0
+        for key in ("capec_example_to_capec", "capec_example_to_cwe", "capec_example_to_attack")
+    )
+    capec_data = None
+    if capec_needed:
+        logger.info("Loading CAPEC bundle")
+        capec_data = load_capec_bundle(cfg.get("CAPEC", {}), logger=logger)
+    else:
+        logger.info("Skipping CAPEC bundle load (CAPEC example tasks disabled)")
 
     logger.info("Loading ATT&CK procedure scenarios")
     scenario_records = collect_procedure_scenarios(cfg.get("MITRE_ATTACK", {}), logger=logger)
@@ -232,25 +258,34 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
         logger.error("Failed mapping-explorer build: %s", exc)
 
     # CAPEC example tasks
-    try:
-        cap_cfg = cfg.get("TASKS", {})
-        capec_out = cap_cfg.get("CAPEC_EXAMPLE_CAPEC", {}).get("output_path", "dataset/minerva/capec_example_to_capec.jsonl")
-        cwe_out = cap_cfg.get("CAPEC_EXAMPLE_CWE", {}).get("output_path", "dataset/minerva/capec_example_to_cwe.jsonl")
-        atk_out = cap_cfg.get("CAPEC_EXAMPLE_ATTACK", {}).get("output_path", "dataset/minerva/capec_example_to_attack.jsonl")
-        cap_seed = int(cap_cfg.get("CAPEC_EXAMPLE_CAPEC", {}).get("seed", 1337))
-        capec_tasks = build_capec_example_tasks(
-            capec_data["patterns"],
-            capec_out=capec_out,
-            cwe_out=cwe_out,
-            attack_out=atk_out,
-            seed=cap_seed,
-            logger=logger,
-        )
-        summary["capec_example_to_capec"] = len(capec_tasks.get("capec", []))
-        summary["capec_example_to_cwe"] = len(capec_tasks.get("cwe", []))
-        summary["capec_example_to_attack"] = len(capec_tasks.get("attack", []))
-    except Exception as exc:
-        logger.error("Failed CAPEC example tasks: %s", exc)
+    if capec_needed:
+        try:
+            cap_cfg = cfg.get("TASKS", {})
+            capec_out = cap_cfg.get("CAPEC_EXAMPLE_CAPEC", {}).get(
+                "output_path", "dataset/minerva/capec_example_to_capec.jsonl"
+            )
+            cwe_out = cap_cfg.get("CAPEC_EXAMPLE_CWE", {}).get(
+                "output_path", "dataset/minerva/capec_example_to_cwe.jsonl"
+            )
+            atk_out = cap_cfg.get("CAPEC_EXAMPLE_ATTACK", {}).get(
+                "output_path", "dataset/minerva/capec_example_to_attack.jsonl"
+            )
+            cap_seed = int(cap_cfg.get("CAPEC_EXAMPLE_CAPEC", {}).get("seed", 1337))
+            capec_tasks = build_capec_example_tasks(
+                capec_data["patterns"],
+                capec_out=capec_out,
+                cwe_out=cwe_out,
+                attack_out=atk_out,
+                seed=cap_seed,
+                logger=logger,
+            )
+            summary["capec_example_to_capec"] = len(capec_tasks.get("capec", []))
+            summary["capec_example_to_cwe"] = len(capec_tasks.get("cwe", []))
+            summary["capec_example_to_attack"] = len(capec_tasks.get("attack", []))
+        except Exception as exc:
+            logger.error("Failed CAPEC example tasks: %s", exc)
+    else:
+        logger.info("Skipping CAPEC example tasks (disabled by sampling config)")
 
     # Sigma rule datasets
     try:
@@ -271,6 +306,22 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
         summary["sigma_to_attack_tactics"] = len(sigma_sets.get("tactic", []))
     except Exception as exc:
         logger.error("Failed sigma build: %s", exc)
+
+    # External detection datasets (prebuilt under dataset/detection)
+    try:
+        minerva_out = cfg.get("COMMON", {}).get("minerva_out", "dataset/minerva")
+        detection_sources = {
+            "art_to_attack_technique": Path("dataset/detection/art_to_attack_technique.jsonl"),
+            "sentinel_to_attack_technique": Path("dataset/detection/sentinel_to_attack_technique.jsonl"),
+            "splunk_to_attack_technique": Path("dataset/detection/splunk_to_attack_technique.jsonl"),
+        }
+        for task_name, src in detection_sources.items():
+            dest = Path(minerva_out) / f"{task_name}.jsonl"
+            count = _copy_external_task(src, dest, logger=logger)
+            if count:
+                summary[task_name] = count
+    except Exception as exc:
+        logger.error("Failed detection dataset import: %s", exc)
 
     tasks_cfg = cfg.get("TASKS", {})
     cap_cfg = tasks_cfg
@@ -370,15 +421,24 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
     except Exception as exc:
         logger.error("Failed scenario->mitigation: %s", exc)
 
-    # Threat actor MCQ
-    try:
-        ta_cfg = tasks_cfg.get("THREAT_ACTOR", {})
-        ta_out = ta_cfg.get("output_path", "dataset/minerva/threat_actor_mcq.jsonl")
-        ta_seed = int(ta_cfg.get("seed", 1337))
-        ta_tasks = build_threat_actor_tasks(cfg.get("MITRE_ATTACK", {}), output_path=ta_out, seed=ta_seed, logger=logger)
-        summary["threat_actor_mcq"] = len(ta_tasks)
-    except Exception as exc:
-        logger.error("Failed threat actor task: %s", exc)
+    # Threat actor (open-ended)
+    if RESAMPLE_COUNTS.get("threat_actor", 0) > 0:
+        try:
+            ta_cfg = tasks_cfg.get("THREAT_ACTOR", {})
+            ta_out = ta_cfg.get("output_path", "dataset/minerva/threat_actor.jsonl")
+            ta_seed = int(ta_cfg.get("seed", 1337))
+            ta_tasks = build_threat_actor_tasks(
+                cfg.get("MITRE_ATTACK", {}),
+                output_path=ta_out,
+                seed=ta_seed,
+                task_cfg=ta_cfg,
+                logger=logger,
+            )
+            summary["threat_actor"] = len(ta_tasks)
+        except Exception as exc:
+            logger.error("Failed threat actor task: %s", exc)
+    else:
+        logger.info("Skipping threat actor tasks (disabled by sampling config)")
 
     # Persist metadata
     meta_path = Path(cfg.get("COMMON", {}).get("metadata_path", "data/processed/minerva/metadata.json"))
@@ -396,10 +456,15 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
         "cve_to_cvss_v40": Path(tasks_cfg.get("CVE_CVSS_V40", {}).get("output_path", "dataset/minerva/cve_to_cvss_v40.jsonl")),
         "sigma_to_attack_technique": Path(minerva_out) / "sigma_to_attack_technique.jsonl",
         "sigma_to_attack_tactics": Path(minerva_out) / "sigma_to_attack_tactics.jsonl",
+        "art_to_attack_technique": Path(minerva_out) / "art_to_attack_technique.jsonl",
+        "sentinel_to_attack_technique": Path(minerva_out) / "sentinel_to_attack_technique.jsonl",
+        "splunk_to_attack_technique": Path(minerva_out) / "splunk_to_attack_technique.jsonl",
         "capec_example_to_capec": Path(cap_cfg.get("CAPEC_EXAMPLE_CAPEC", {}).get("output_path", "dataset/minerva/capec_example_to_capec.jsonl")),
         "capec_example_to_cwe": Path(cap_cfg.get("CAPEC_EXAMPLE_CWE", {}).get("output_path", "dataset/minerva/capec_example_to_cwe.jsonl")),
         "capec_example_to_attack": Path(cap_cfg.get("CAPEC_EXAMPLE_ATTACK", {}).get("output_path", "dataset/minerva/capec_example_to_attack.jsonl")),
-        "threat_actor_mcq": Path(tasks_cfg.get("THREAT_ACTOR", {}).get("output_path", "dataset/minerva/threat_actor_mcq.jsonl")),
+        "threat_actor": Path(
+            tasks_cfg.get("THREAT_ACTOR", {}).get("output_path", "dataset/minerva/threat_actor.jsonl")
+        ),
         "scenario_to_technique": Path(tasks_cfg.get("SCENARIO_TECHNIQUE", {}).get("output_path", "dataset/minerva/scenario_to_technique.jsonl")),
         "scenario_to_tactics": Path(tasks_cfg.get("SCENARIO_TACTIC", {}).get("output_path", "dataset/minerva/scenario_to_tactics.jsonl")),
         "scenario_to_mitigations": Path(tasks_cfg.get("SCENARIO_MITIGATION", {}).get("output_path", "dataset/minerva/scenario_to_mitigations.jsonl")),
@@ -407,9 +472,13 @@ def build_minerva_dataset(cfg: Dict, *, logger, detailed_prompts: bool) -> None:
     dedupe_info: Dict[str, int] = {}
     for task_name, path in task_paths.items():
         if task_name in summary:
-            kept, removed = _dedupe_jsonl(path)
-            if removed:
-                dedupe_info[task_name] = removed
+            if task_name == "threat_actor":
+                kept = sum(1 for _ in _iter_jsonl(path))
+                removed = 0
+            else:
+                kept, removed = _dedupe_jsonl(path)
+                if removed:
+                    dedupe_info[task_name] = removed
             target_n = RESAMPLE_COUNTS.get(task_name)
             if target_n is not None:
                 resampled, _ = _resample_jsonl(path, target_n, resample_rng, logger=logger)

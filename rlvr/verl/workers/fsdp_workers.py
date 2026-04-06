@@ -43,6 +43,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
+from verl.utils.attention import resolve_attn_implementation
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
@@ -164,6 +165,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._ema_teacher_enabled = False
+        self._ema_teacher_initialized = False
+        self._ema_teacher_alpha = None
+        self._ema_actor_module_fsdp = None
+        self._ema_actor_module = None
+        self._ema_param_pairs = []
+        self._ema_buffer_pairs = []
 
         # TODO(haibin.lin):
         # As of now the type of config is DictConfig, if we assign config.profiler with ProfilerConfig,
@@ -258,7 +266,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -286,8 +298,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        actor_attn_impl = resolve_attn_implementation("flash_attention_2")
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=actor_attn_impl
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -704,6 +717,104 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
+    def _ema_teacher_build_pairs(self) -> None:
+        self._ema_param_pairs = []
+        self._ema_buffer_pairs = []
+        if self._ema_actor_module_fsdp is None or self.actor_module_fsdp is None:
+            return
+        actor_params = dict(self.actor_module_fsdp.named_parameters())
+        for name, ema_param in self._ema_actor_module_fsdp.named_parameters():
+            actor_param = actor_params.get(name)
+            if actor_param is None:
+                continue
+            self._ema_param_pairs.append((ema_param, actor_param))
+        actor_buffers = dict(self.actor_module_fsdp.named_buffers())
+        for name, ema_buf in self._ema_actor_module_fsdp.named_buffers():
+            actor_buf = actor_buffers.get(name)
+            if actor_buf is None:
+                continue
+            self._ema_buffer_pairs.append((ema_buf, actor_buf))
+
+    def _ema_teacher_copy_from_actor(self) -> None:
+        if not self._ema_param_pairs:
+            self._ema_teacher_build_pairs()
+        if not self._ema_param_pairs:
+            return
+        with torch.no_grad():
+            for ema_param, param in self._ema_param_pairs:
+                ema_param.data.copy_(param.data)
+            for ema_buf, buf in self._ema_buffer_pairs:
+                ema_buf.data.copy_(buf.data)
+
+    def _ema_teacher_update(self) -> None:
+        if not self._ema_param_pairs:
+            self._ema_teacher_build_pairs()
+        if not self._ema_param_pairs:
+            return
+        alpha = float(self._ema_teacher_alpha or 0.0)
+        with torch.no_grad():
+            for ema_param, param in self._ema_param_pairs:
+                ema_param.data.mul_(alpha).add_(param.data, alpha=1.0 - alpha)
+            for ema_buf, buf in self._ema_buffer_pairs:
+                ema_buf.data.copy_(buf.data)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_ema_teacher(self, alpha: float = 0.995):
+        if not self._is_actor:
+            raise RuntimeError("EMA teacher requires actor role.")
+        if self.actor_module_fsdp is None:
+            raise RuntimeError("EMA teacher init requires actor model initialization.")
+        try:
+            alpha = float(alpha)
+        except (TypeError, ValueError):
+            alpha = 0.995
+        if alpha <= 0.0 or alpha >= 1.0:
+            alpha = 0.995
+        self._ema_teacher_alpha = alpha
+        if self._ema_teacher_initialized and self._ema_actor_module_fsdp is not None:
+            self._ema_teacher_enabled = True
+            self._ema_teacher_copy_from_actor()
+            return True
+
+        override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+        use_remove_padding = self.config.model.get("use_remove_padding", False)
+        use_shm = self.config.model.get("use_shm", False)
+        use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+        fsdp_config = omega_conf_to_dataclass(self.config.actor.fsdp_config)
+        self._ema_actor_module_fsdp, _, _, _ = self._build_model_optimizer(
+            model_path=local_path,
+            fsdp_config=fsdp_config,
+            optim_config=None,
+            override_model_config=override_model_config,
+            use_remove_padding=use_remove_padding,
+            use_fused_kernels=use_fused_kernels,
+            enable_gradient_checkpointing=self.config.model.get("enable_gradient_checkpointing", False),
+            trust_remote_code=self.config.model.get("trust_remote_code", False),
+            use_liger=self.config.model.get("use_liger", False),
+            role="actor",
+            enable_activation_offload=self.config.model.get("enable_activation_offload", False),
+        )
+        if fsdp_version(self._ema_actor_module_fsdp) == 1:
+            self._ema_actor_module = self._ema_actor_module_fsdp._fsdp_wrapped_module
+        self._ema_actor_module_fsdp.eval()
+        for param in self._ema_actor_module_fsdp.parameters():
+            param.requires_grad_(False)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self._ema_actor_module_fsdp)
+        self._ema_teacher_enabled = True
+        self._ema_teacher_initialized = True
+        self._ema_teacher_build_pairs()
+        self._ema_teacher_copy_from_actor()
+        return True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_ema_teacher(self):
+        if not self._ema_teacher_enabled or self._ema_actor_module_fsdp is None:
+            return False
+        self._ema_teacher_copy_from_actor()
+        return True
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
@@ -712,6 +823,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        lr_scale = 1.0
+        orig_lrs = None
+        sft_mode = bool(data.meta_info.get("sft_mode", False))
+        dpo_mode = bool(data.meta_info.get("dpo_mode", False))
+        if sft_mode or dpo_mode:
+            scale_key = "dpo_lr_scale" if dpo_mode else "sft_lr_scale"
+            try:
+                lr_scale = float(data.meta_info.get(scale_key, 1.0))
+            except (TypeError, ValueError):
+                lr_scale = 1.0
+            if lr_scale != 1.0:
+                orig_lrs = [pg.get("lr", 0.0) for pg in self.actor_optimizer.param_groups]
+                for pg in self.actor_optimizer.param_groups:
+                    pg["lr"] = pg.get("lr", 0.0) * lr_scale
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -729,6 +855,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
+            if orig_lrs is not None:
+                for pg, lr in zip(self.actor_optimizer.param_groups, orig_lrs):
+                    pg["lr"] = lr
+                if dpo_mode:
+                    metrics["actor/dpo_lr_scale"] = lr_scale
+                else:
+                    metrics["actor/sft_lr_scale"] = lr_scale
+
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
             self.actor_lr_scheduler.step()
@@ -745,6 +879,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        if self._ema_teacher_enabled and self._ema_actor_module_fsdp is not None:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self._ema_actor_module_fsdp)
+            self._ema_teacher_update()
+
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -755,14 +894,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         assert self._is_rollout
 
+        use_ema_teacher = bool(prompts.meta_info.get("acr_use_ema_teacher", False))
+        swap_module = use_ema_teacher and self._ema_teacher_enabled and self._ema_actor_module_fsdp is not None
+        orig_module = None
+
         timing_generate = {}
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+        if swap_module:
+            orig_module = self.rollout_sharding_manager.module
+            self.rollout_sharding_manager.module = self._ema_actor_module_fsdp
+        try:
+            with self.rollout_sharding_manager:
+                log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
-            with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
+                with simple_timer("generate_sequences", timing_generate):
+                    output = self.rollout.generate_sequences(prompts=prompts)
 
-            log_gpu_memory_usage("After rollout generation", logger=logger)
+                log_gpu_memory_usage("After rollout generation", logger=logger)
+        finally:
+            if orig_module is not None:
+                self.rollout_sharding_manager.module = orig_module
 
         timing_generate.update(self.rollout_sharding_manager.timing)
         # We calculate the average timing across all ranks
@@ -861,6 +1011,82 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def generate_judge_outputs(
+        self,
+        prompts: list[str],
+        max_new_tokens: int = 8,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        batch_size: int = 8,
+    ) -> list[str]:
+        if not self._is_ref:
+            raise RuntimeError("generate_judge_outputs is only available on ref workers.")
+        if not prompts:
+            return []
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.ref_module_fsdp)
+
+        tokenizer = self.tokenizer
+        pad_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        try:
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+        finally:
+            tokenizer.padding_side = pad_side
+
+        input_ids = inputs["input_ids"].to(get_device_id())
+        attention_mask = inputs["attention_mask"].to(get_device_id())
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        do_sample = float(temperature) > 0.0
+        generate_kwargs = {
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": do_sample,
+            "top_p": float(top_p),
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "return_dict_in_generate": True,
+            "use_cache": True,
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = float(temperature)
+
+        from contextlib import nullcontext
+
+        param_ctx = nullcontext()
+        if isinstance(self.ref_module_fsdp, FSDP):
+            param_ctx = FSDP.summon_full_params(self.ref_module_fsdp, writeback=False, recurse=False)
+
+        with param_ctx, torch.inference_mode(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            generated = self.ref_module_fsdp.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **generate_kwargs,
+            )
+
+        sequences = generated.sequences
+        input_len = input_ids.shape[-1]
+        outputs: list[str] = []
+        for seq in sequences:
+            gen_ids = seq[int(input_len) :].tolist()
+            outputs.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+
+        if self.world_size > 1:
+            if fsdp_version(self.ref_module_fsdp) == 1:
+                self.ref_module_fsdp._handle.reshard(True)
+            elif fsdp_version(self.ref_module_fsdp) == 2:
+                self.ref_module_fsdp.reshard()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
+
+        return outputs
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
@@ -1075,7 +1301,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=resolve_attn_implementation("flash_attention_2"),
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
@@ -1463,7 +1689,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=resolve_attn_implementation("flash_attention_2"),
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1516,15 +1742,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         self.reward_module = self._build_model(config=self.config)
 
     def _forward_micro_batch(self, micro_batch):
-        if is_cuda_available:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-        elif is_npu_available:
-            from transformers.integrations.npu_flash_attention import (
-                index_first_axis,
-                pad_input,
-                rearrange,
-                unpad_input,
-            )
+        from verl.utils.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 

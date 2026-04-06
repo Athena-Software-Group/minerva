@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ACRD per-batch training: RLVR -> ACR generation -> distill (SFT or DPO).
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DATA_DIR="$ROOT_DIR/mydata"
+REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+export PYTHONPATH="$ROOT_DIR:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+export WANDB_START_METHOD=thread
+export WANDB_DISABLE_SERVICE=true
+export PYTHONUNBUFFERED=1
+export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
+export VERL_VAL_DEBUG="${VERL_VAL_DEBUG:-1}"
+export VERL_VAL_LOG_EVERY="${VERL_VAL_LOG_EVERY:-1}"
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-1}"
+export RAY_DEDUP_LOGS_AGG_WINDOW_S="${RAY_DEDUP_LOGS_AGG_WINDOW_S:-60}"
+export RAY_LOG_TO_STDERR="${RAY_LOG_TO_STDERR:-0}"
+export ACRD_DEBUG_SAMPLES="${ACRD_DEBUG_SAMPLES:-2}"
+export ACRD_DETAILS_DEBUG_SAMPLES="${ACRD_DETAILS_DEBUG_SAMPLES:-2}"
+export ACRD_ML_DEBUG_SAMPLES="${ACRD_ML_DEBUG_SAMPLES:-2}"
+
+MODEL_PATH="${ACRD_MODEL_PATH:-meta-llama/Llama-3.2-3B-Instruct}"
+MODEL_NAME="$(basename "$MODEL_PATH")"
+MODEL_SLUG="$(printf "%s" "$MODEL_NAME" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/^_//;s/_$//')"
+if [ -z "$MODEL_SLUG" ]; then
+  MODEL_SLUG="model"
+fi
+EXPERIMENT_NAME="${ACRD_EXPERIMENT_NAME:-minerva_noctua_${MODEL_SLUG}}"
+
+TRAIN_PATH="${ACRD_TRAIN_PATH:-$DATA_DIR/minerva_base/minerva_base_train.parquet}"
+VAL_PATHS=(
+  "${ACRD_VAL_PATH_1:-$DATA_DIR/minerva_base/minerva_base_dev.parquet}"
+  "${ACRD_VAL_PATH_2:-$DATA_DIR/athena/athena_cti_ate.parquet}"
+  "${ACRD_VAL_PATH_3:-$DATA_DIR/athena/athena_cti_ckt.parquet}"
+  "${ACRD_VAL_PATH_4:-$DATA_DIR/athena/athena_cti_rcm.parquet}"
+  "${ACRD_VAL_PATH_5:-$DATA_DIR/athena/athena_cti_rms.parquet}"
+  "${ACRD_VAL_PATH_6:-$DATA_DIR/athena/athena_cti_taa.parquet}"
+  "${ACRD_VAL_PATH_7:-$DATA_DIR/athena/athena_cti_vsp.parquet}"
+)
+
+TRAIN_FILES="['$TRAIN_PATH']"
+VAL_FILES="['${VAL_PATHS[0]}','${VAL_PATHS[1]}','${VAL_PATHS[2]}','${VAL_PATHS[3]}','${VAL_PATHS[4]}','${VAL_PATHS[5]}','${VAL_PATHS[6]}']"
+
+OUTPUT_ROOT="${ACRD_OUTPUT_ROOT:-$ROOT_DIR/checkpoints/minerva/$EXPERIMENT_NAME}"
+LABEL_DETAILS_DIR="${ACRD_LABEL_DETAILS_DIR:-$REPO_ROOT/dataset/label_details}"
+TEXTCNN_MODEL_NAME="textcnn-response-only-lr6e-4-k345-f384-e300-t1024-d0p25"
+LOCAL_TEXTCNN_MODEL="$REPO_ROOT/dataset/models/$TEXTCNN_MODEL_NAME"
+LEGACY_HF_TEXTCNN_MODEL="xashru/$TEXTCNN_MODEL_NAME"
+
+RLVR_MAX_PROMPT_LEN="${ACRD_RLVR_MAX_PROMPT_LEN:-2048}"
+ACR_MAX_PROMPT_LEN="${ACRD_ACR_MAX_PROMPT_LEN:-4096}"
+MAX_RESPONSE_LEN="${ACRD_MAX_RESPONSE_LEN:-1024}"
+ACR_MAX_DETAILS_CHARS="${ACRD_MAX_DETAILS_CHARS:-8096}"
+ACR_ROLLOUT_N="${ACRD_ACR_ROLLOUT_N:-4}"
+ACR_ROLLOUT_TEMPERATURE="${ACRD_ACR_ROLLOUT_TEMPERATURE:-}"
+ACR_ROLLOUT_TOP_P="${ACRD_ACR_ROLLOUT_TOP_P:-}"
+ACR_ROLLOUT_TOP_K="${ACRD_ACR_ROLLOUT_TOP_K:-}"
+ACR_DEFER_GENERATION="${ACRD_ACR_DEFER_GENERATION:-false}"
+ACR_EMA_TEACHER_ENABLED="${ACRD_ACR_EMA_TEACHER_ENABLED:-false}"
+ACR_EMA_TEACHER_ALPHA="${ACRD_ACR_EMA_TEACHER_ALPHA:-0.995}"
+ACR_RL_WEIGHT="${ACRD_ACR_RL_WEIGHT:-0.3}"
+ACR_HARD_REWARD_MODE="${ACRD_ACR_HARD_REWARD_MODE:-max}"
+ACR_HARD_REWARD_THRESHOLD="${ACRD_ACR_HARD_REWARD_THRESHOLD:-1.0}"
+ACR_SKIP_CVSS="${ACRD_ACR_SKIP_CVSS:-true}"
+
+ACR_DISTILL_INTERVAL="${ACRD_ACR_DISTILL_INTERVAL:-10}"
+ACR_DISTILL_THRESHOLD="${ACRD_ACR_DISTILL_THRESHOLD:-1.0}"
+ACR_DISTILL_SELECTION_MODE="${ACRD_ACR_DISTILL_SELECTION_MODE:-random}"
+ACR_DISTILL_BUFFER_MODE="${ACRD_ACR_DISTILL_BUFFER_MODE:-rolling}"
+if [ -z "${ACRD_ACR_DISTILL_BATCH_SIZE+x}" ]; then
+  if [ "$ACR_DISTILL_BUFFER_MODE" = "flush" ]; then
+    ACR_DISTILL_BATCH_SIZE=512
+  else
+    ACR_DISTILL_BATCH_SIZE=256
+  fi
+else
+  ACR_DISTILL_BATCH_SIZE="${ACRD_ACR_DISTILL_BATCH_SIZE}"
+fi
+if [ -z "${ACRD_ACR_DISTILL_MAX_BUFFER+x}" ]; then
+  if [ "$ACR_DISTILL_BUFFER_MODE" = "flush" ]; then
+    ACR_DISTILL_MAX_BUFFER=0
+  else
+    ACR_DISTILL_MAX_BUFFER=1024
+  fi
+else
+  ACR_DISTILL_MAX_BUFFER="${ACRD_ACR_DISTILL_MAX_BUFFER}"
+fi
+if [ -z "${ACRD_ACR_DISTILL_MIN_BUFFER+x}" ]; then
+  if [ "$ACR_DISTILL_BUFFER_MODE" = "buffer" ]; then
+    ACR_DISTILL_MIN_BUFFER=256
+  else
+    ACR_DISTILL_MIN_BUFFER=0
+  fi
+else
+  ACR_DISTILL_MIN_BUFFER="${ACRD_ACR_DISTILL_MIN_BUFFER}"
+fi
+ACR_DISTILL_DEGENERATE_FILTER="${ACRD_ACR_DISTILL_DEGENERATE_FILTER:-true}"
+ACR_DISTILL_DEGENERATE_MIN_TOKENS="${ACRD_ACR_DISTILL_DEGENERATE_MIN_TOKENS:-30}"
+ACR_DISTILL_DEGENERATE_REP3_MAX="${ACRD_ACR_DISTILL_DEGENERATE_REP3_MAX:-0.70}"
+ACR_DISTILL_DEGENERATE_REP4_MAX="${ACRD_ACR_DISTILL_DEGENERATE_REP4_MAX:-0.75}"
+ACR_DISTILL_LR_SCALE="${ACRD_ACR_DISTILL_LR_SCALE:-1.0}"
+ACR_DISTILL_ENTROPY_BETA="${ACRD_ACR_DISTILL_ENTROPY_BETA:-1.0}"
+ACR_DISTILL_ENTROPY_SAMPLING="${ACRD_ACR_DISTILL_ENTROPY_SAMPLING:-true}"
+ACR_DISTILL_DISABLE_FILTERS="${ACRD_ACR_DISTILL_DISABLE_FILTERS:-false}"
+ACR_DISTILL_METHOD="${ACRD_ACR_DISTILL_METHOD:-sft}"
+DPO_BETA="${ACRD_DPO_BETA:-0.1}"
+ACR_REWARD_MANAGER="${ACRD_ACR_REWARD_MANAGER:-naive}"
+ACR_MAX_ID_MENTIONS="${ACRD_ACR_MAX_ID_MENTIONS:-0}"
+ACR_MIN_REASONING_CHARS="${ACRD_ACR_MIN_REASONING_CHARS:-100}"
+ACR_MIN_OVERLAP_JACCARD="${ACRD_ACR_MIN_OVERLAP_JACCARD:-0.05}"
+ACR_EXCLUDE_CVSS_TRAIN="${ACRD_EXCLUDE_CVSS_TRAIN:-false}"
+ACR_JUDGE_ENABLED="${ACRD_JUDGE_ENABLED:-false}"
+ACR_JUDGE_MODEL="${ACRD_JUDGE_MODEL:-openai/gpt-oss-20b}"
+ACR_JUDGE_BACKEND="${ACRD_JUDGE_BACKEND:-hf}"
+ACR_JUDGE_MAX_NEW_TOKENS="${ACRD_JUDGE_MAX_NEW_TOKENS:-32}"
+ACR_JUDGE_TEMPERATURE="${ACRD_JUDGE_TEMPERATURE:-0.0}"
+ACR_JUDGE_TOP_P="${ACRD_JUDGE_TOP_P:-1.0}"
+ACR_JUDGE_DEVICE="${ACRD_JUDGE_DEVICE:-auto}"
+ACR_JUDGE_DEVICE_MAP="${ACRD_JUDGE_DEVICE_MAP:-auto}"
+ACR_JUDGE_DTYPE="${ACRD_JUDGE_DTYPE:-auto}"
+ACR_JUDGE_TRUST_REMOTE_CODE="${ACRD_JUDGE_TRUST_REMOTE_CODE:-true}"
+
+TRAIN_BATCH_SIZE="${ACRD_TRAIN_BATCH_SIZE:-128}"
+VAL_BATCH_SIZE="${ACRD_VAL_BATCH_SIZE:-3000}"
+ACR_JUDGE_BATCH_SIZE="${ACRD_JUDGE_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
+ACR_DISTILL_FILTER_MODE="${ACRD_ACR_DISTILL_FILTER_MODE:-ml}"
+if [ -z "${ACRD_ACR_DISTILL_FILTER_MODEL:-}" ]; then
+  if [ -d "$LOCAL_TEXTCNN_MODEL" ]; then
+    ACR_DISTILL_FILTER_MODEL="$LOCAL_TEXTCNN_MODEL"
+  else
+    ACR_DISTILL_FILTER_MODEL="$LEGACY_HF_TEXTCNN_MODEL"
+  fi
+elif { [ "${ACRD_ACR_DISTILL_FILTER_MODEL}" = "$TEXTCNN_MODEL_NAME" ] || [ "${ACRD_ACR_DISTILL_FILTER_MODEL}" = "$LEGACY_HF_TEXTCNN_MODEL" ]; } && [ -d "$LOCAL_TEXTCNN_MODEL" ]; then
+  ACR_DISTILL_FILTER_MODEL="$LOCAL_TEXTCNN_MODEL"
+elif [ "${ACRD_ACR_DISTILL_FILTER_MODEL}" = "$TEXTCNN_MODEL_NAME" ]; then
+  ACR_DISTILL_FILTER_MODEL="$LEGACY_HF_TEXTCNN_MODEL"
+else
+  ACR_DISTILL_FILTER_MODEL="${ACRD_ACR_DISTILL_FILTER_MODEL}"
+fi
+ACR_DISTILL_FILTER_MODEL_TYPE="${ACRD_ACR_DISTILL_FILTER_MODEL_TYPE:-textcnn}"
+ACR_DISTILL_FILTER_THRESHOLD="${ACRD_ACR_DISTILL_FILTER_THRESHOLD:-0.5}"
+ACR_DISTILL_FILTER_BATCH_SIZE="${ACRD_ACR_DISTILL_FILTER_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
+ACR_DISTILL_FILTER_MAX_LENGTH="${ACRD_ACR_DISTILL_FILTER_MAX_LENGTH:-1024}"
+ACR_DISTILL_FILTER_TEXT_MODE="${ACRD_ACR_DISTILL_FILTER_TEXT_MODE:-response}"
+ACR_DISTILL_FILTER_DEVICE="${ACRD_ACR_DISTILL_FILTER_DEVICE:-auto}"
+ACR_DISTILL_FILTER_DTYPE="${ACRD_ACR_DISTILL_FILTER_DTYPE:-auto}"
+ACR_DISTILL_FILTER_TOKENIZER="${ACRD_ACR_DISTILL_FILTER_TOKENIZER:-}"
+ACR_DISTILL_FILTER_TRUST_REMOTE_CODE="${ACRD_ACR_DISTILL_FILTER_TRUST_REMOTE_CODE:-false}"
+N_GPUS="${ACRD_N_GPUS_PER_NODE:-4}"
+ROLLOUT_GPU_UTIL="${ACRD_ROLLOUT_GPU_UTIL:-0.95}"
+TOTAL_STEPS="${ACRD_TOTAL_STEPS:-500}"
+SAVE_FREQ="${ACRD_SAVE_FREQ:-10}"
+TEST_FREQ="${ACRD_TEST_FREQ:-10}"
+SAVE_BEST_ONLY="${ACRD_SAVE_BEST_ONLY:-true}"
+SAVE_BEST_METRIC="${ACRD_SAVE_BEST_METRIC:-val-core/global-val/reward/mean}"
+SAVE_BEST_MODE="${ACRD_SAVE_BEST_MODE:-max}"
+SAVE_BEST_DIR="${ACRD_SAVE_BEST_DIR:-best}"
+
+ACR_ROLLOUT_ARGS=()
+if [ -n "$ACR_ROLLOUT_TEMPERATURE" ]; then
+  ACR_ROLLOUT_ARGS+=(+data.acr.rollout_sampling.temperature="$ACR_ROLLOUT_TEMPERATURE")
+fi
+if [ -n "$ACR_ROLLOUT_TOP_P" ]; then
+  ACR_ROLLOUT_ARGS+=(+data.acr.rollout_sampling.top_p="$ACR_ROLLOUT_TOP_P")
+fi
+if [ -n "$ACR_ROLLOUT_TOP_K" ]; then
+  ACR_ROLLOUT_ARGS+=(+data.acr.rollout_sampling.top_k="$ACR_ROLLOUT_TOP_K")
+fi
+
+REWARD_FN_PATH="$ROOT_DIR/verl/utils/reward_score/reward_minerva.py"
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files="$TRAIN_FILES" \
+    data.val_files="$VAL_FILES" \
+    data.dataloader_num_workers=0 \
+    data.return_raw_chat=true \
+    data.max_prompt_length="$RLVR_MAX_PROMPT_LEN" \
+    data.max_response_length="$MAX_RESPONSE_LEN" \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    +data.acr={} \
+    +data.acr.distill={} \
+    +data.acr.per_batch=true \
+    +data.acr.label_details_dir="$LABEL_DETAILS_DIR" \
+    +data.acr.max_details_chars="$ACR_MAX_DETAILS_CHARS" \
+    +data.acr.max_prompt_length="$ACR_MAX_PROMPT_LEN" \
+    +data.acr.rollout_n="$ACR_ROLLOUT_N" \
+    +data.acr.defer_generation="$ACR_DEFER_GENERATION" \
+    +data.acr.ema_teacher.enabled="$ACR_EMA_TEACHER_ENABLED" \
+    +data.acr.ema_teacher.alpha="$ACR_EMA_TEACHER_ALPHA" \
+    +data.acr.rl_weight="$ACR_RL_WEIGHT" \
+    +data.acr.hard_reward_mode="$ACR_HARD_REWARD_MODE" \
+    +data.acr.hard_reward_threshold="$ACR_HARD_REWARD_THRESHOLD" \
+    +data.acr.skip_cvss="$ACR_SKIP_CVSS" \
+    +data.acr.update_actor=false \
+    +data.acr.enforce_no_id_in_reasoning=false \
+    +data.acr.reward_kwargs.r_correct=0.1 \
+    +data.acr.reward_kwargs.leak_penalty=0.5 \
+    +data.acr.reward_kwargs.multilabel_match=exact \
+    +data.acr.reward_kwargs.enforce_no_id_in_reasoning=false \
+    +data.acr.reward_kwargs.max_id_mentions="$ACR_MAX_ID_MENTIONS" \
+    +data.acr.reward_kwargs.min_reasoning_chars="$ACR_MIN_REASONING_CHARS" \
+    +data.acr.reward_kwargs.min_overlap_jaccard="$ACR_MIN_OVERLAP_JACCARD" \
+    +data.acr.reward_manager="$ACR_REWARD_MANAGER" \
+    +data.acr.reward_kwargs.judge_enabled="$ACR_JUDGE_ENABLED" \
+    +data.acr.reward_kwargs.judge_model="$ACR_JUDGE_MODEL" \
+    +data.acr.reward_kwargs.judge_backend="$ACR_JUDGE_BACKEND" \
+    +data.acr.reward_kwargs.judge_batch_size="$ACR_JUDGE_BATCH_SIZE" \
+    +data.acr.reward_kwargs.judge_max_new_tokens="$ACR_JUDGE_MAX_NEW_TOKENS" \
+    +data.acr.reward_kwargs.judge_temperature="$ACR_JUDGE_TEMPERATURE" \
+    +data.acr.reward_kwargs.judge_top_p="$ACR_JUDGE_TOP_P" \
+    +data.acr.reward_kwargs.judge_device="$ACR_JUDGE_DEVICE" \
+    +data.acr.reward_kwargs.judge_device_map="$ACR_JUDGE_DEVICE_MAP" \
+    +data.acr.reward_kwargs.judge_dtype="$ACR_JUDGE_DTYPE" \
+    +data.acr.reward_kwargs.judge_trust_remote_code="$ACR_JUDGE_TRUST_REMOTE_CODE" \
+    +data.acr.distill.enabled=true \
+    +data.acr.distill.interval="$ACR_DISTILL_INTERVAL" \
+    +data.acr.distill.reward_threshold="$ACR_DISTILL_THRESHOLD" \
+    +data.acr.distill.selection_mode="$ACR_DISTILL_SELECTION_MODE" \
+    +data.acr.distill.batch_size="$ACR_DISTILL_BATCH_SIZE" \
+    +data.acr.distill.degenerate_filter="$ACR_DISTILL_DEGENERATE_FILTER" \
+    +data.acr.distill.degenerate_min_tokens="$ACR_DISTILL_DEGENERATE_MIN_TOKENS" \
+    +data.acr.distill.degenerate_rep_3_max="$ACR_DISTILL_DEGENERATE_REP3_MAX" \
+    +data.acr.distill.degenerate_rep_4_max="$ACR_DISTILL_DEGENERATE_REP4_MAX" \
+    +data.acr.distill.max_buffer="$ACR_DISTILL_MAX_BUFFER" \
+    +data.acr.distill.min_buffer="$ACR_DISTILL_MIN_BUFFER" \
+    +data.acr.distill.buffer_mode="$ACR_DISTILL_BUFFER_MODE" \
+    +data.acr.distill.lr_scale="$ACR_DISTILL_LR_SCALE" \
+    +data.acr.distill.entropy_beta="$ACR_DISTILL_ENTROPY_BETA" \
+    +data.acr.distill.entropy_sampling="$ACR_DISTILL_ENTROPY_SAMPLING" \
+    +data.acr.distill.disable_filters="$ACR_DISTILL_DISABLE_FILTERS" \
+    +data.acr.distill.filter_mode="$ACR_DISTILL_FILTER_MODE" \
+    +data.acr.distill.filter_model="$ACR_DISTILL_FILTER_MODEL" \
+    +data.acr.distill.filter_model_type="$ACR_DISTILL_FILTER_MODEL_TYPE" \
+    +data.acr.distill.filter_threshold="$ACR_DISTILL_FILTER_THRESHOLD" \
+    +data.acr.distill.filter_batch_size="$ACR_DISTILL_FILTER_BATCH_SIZE" \
+    +data.acr.distill.filter_max_length="$ACR_DISTILL_FILTER_MAX_LENGTH" \
+    +data.acr.distill.filter_text_mode="$ACR_DISTILL_FILTER_TEXT_MODE" \
+    +data.acr.distill.filter_device="$ACR_DISTILL_FILTER_DEVICE" \
+    +data.acr.distill.filter_dtype="$ACR_DISTILL_FILTER_DTYPE" \
+    +data.acr.distill.filter_tokenizer="$ACR_DISTILL_FILTER_TOKENIZER" \
+    +data.acr.distill.filter_trust_remote_code="$ACR_DISTILL_FILTER_TRUST_REMOTE_CODE" \
+    +data.acr.distill.method="$ACR_DISTILL_METHOD" \
+    +data.acr.distill.dpo.beta="$DPO_BETA" \
+    ++data.exclude_cvss_train="$ACR_EXCLUDE_CVSS_TRAIN" \
+    custom_reward_function.path="$REWARD_FN_PATH" \
+    custom_reward_function.name=reward_minerva \
+    +custom_reward_function.reward_kwargs.return_dict=true \
+    data.train_batch_size="$TRAIN_BATCH_SIZE" \
+    data.val_batch_size="$VAL_BATCH_SIZE" \
+    actor_rollout_ref.model.path="$MODEL_PATH" \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.0 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0.0 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_UTIL" \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.logger='["console", "wandb"]' \
+    trainer.project_name='minerva' \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
+    trainer.val_before_train=False \
+    trainer.n_gpus_per_node="$N_GPUS" \
+    trainer.nnodes=1 \
+    trainer.save_freq="$SAVE_FREQ" \
+    trainer.test_freq="$TEST_FREQ" \
+    +trainer.save_best_only="$SAVE_BEST_ONLY" \
+    +trainer.save_best_metric="$SAVE_BEST_METRIC" \
+    +trainer.save_best_mode="$SAVE_BEST_MODE" \
+    +trainer.save_best_dir="$SAVE_BEST_DIR" \
+    trainer.total_training_steps="$TOTAL_STEPS" \
+    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.max_critic_ckpt_to_keep=1 \
+    trainer.default_local_dir="$OUTPUT_ROOT" \
+    "${ACR_ROLLOUT_ARGS[@]}" \
+    "$@"

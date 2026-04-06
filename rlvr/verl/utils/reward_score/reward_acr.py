@@ -40,6 +40,318 @@ DEFAULT_BANNED_PHRASES = [
     "the provided answer",
     "the answer you gave",
     "the label you gave",
+    "label reference",
+    "label references",
+    "label detail",
+    "label details",
+    "label text",
+    "label description",
+    "label reference text",
+    "label reference description",
+    "label detail text",
+    "label detail description",
+    "label details text",
+    "label details description",
+    "reference text",
+    "reference description",
+    "reference details",
+    "reference info",
+    "reference information",
+    "reference material",
+    "reference entry",
+    "reference entry text",
+    "reference entry description",
+    "reference entry details",
+    "catalog entry",
+    "catalog description",
+    "catalog details",
+    "catalog text",
+    "catalog information",
+    "catalog reference",
+    "manifestation text",
+    "manifestation description",
+    "manifestation details",
+    "manifestation reference",
+    "entry text",
+    "entry description",
+    "entry details",
+    "entry information",
+    "entry reference",
+    "entry says",
+    "entry states",
+    "entry notes",
+    "entry indicates",
+    "entry mentions",
+    "entry describes",
+    "entry shows",
+    "the label reference",
+    "the label details",
+    "the label description",
+    "the reference",
+    "the reference text",
+    "the reference description",
+    "the reference details",
+    "the reference entry",
+    "the catalog entry",
+    "the catalog description",
+    "the catalog details",
+    "the catalog text",
+    "the entry",
+    "the entry text",
+    "the entry description",
+    "the entry details",
+    "label says",
+    "label states",
+    "label notes",
+    "label indicates",
+    "label mentions",
+    "label describes",
+    "label shows",
+    "label implies",
+    "label suggests",
+    "reference says",
+    "reference states",
+    "reference notes",
+    "reference indicates",
+    "reference mentions",
+    "reference describes",
+    "reference shows",
+    "reference lists",
+    "details say",
+    "details state",
+    "details note",
+    "details indicate",
+    "details mention",
+    "details describe",
+    "details show",
+    "details list",
+    "manifestation says",
+    "manifestation states",
+    "manifestation notes",
+    "manifestation indicates",
+    "manifestation mentions",
+    "manifestation describes",
+    "manifestation shows",
+    "according to the label",
+    "from the label",
+    "according to the reference",
+    "from the reference",
+    "based on the reference",
+    "based on the label",
+    "per the reference",
+    "per the label",
+    "as described in the label",
+    "as described in the reference",
+    "as described in the details",
+    "as stated in the label",
+    "as stated in the reference",
+    "as stated in the details",
+    "from the details",
+    "from the manifestation",
+    "per the details",
+    "per the manifestation",
+    "based on the details",
+    "as listed in the label",
+    "as listed in the reference",
+    "as listed in the details",
+    "as listed in the catalog",
+    "as listed in the entry",
+    "cw id manifestation",
+    "cwe entry",
+    "cwe entry text",
+    "cwe entry description",
+    "cwe entry details",
+    "cwe definition",
+    "cwe description",
+    "cwe reference",
+    "attack technique entry",
+    "attack technique description",
+    "attack technique definition",
+    "technique entry",
+    "technique description text",
+    "technique definition",
+    "tactic entry",
+    "tactic description text",
+    "tactic definition",
+    "mitigation entry",
+    "mitigation description text",
+    "mitigation definition",
+    "attack pattern entry",
+    "attack pattern description text",
+    "attack pattern definition",
+    "given reference",
+    "provided reference",
+    "supplied reference",
+    "attached reference",
+    "given details",
+    "provided details",
+    "supplied details",
+    "attached details",
+    "given manifestation",
+    "provided manifestation",
+    "supplied manifestation",
+    "attached manifestation",
+    "given label description",
+    "provided label description",
+    "supplied label description",
+    "attached label description",
+    "provided by the label",
+    "provided in the label",
+    "provided by the reference",
+    "provided in the reference",
+    "provided by the details",
+    "provided in the details",
+    "provided by the catalog",
+    "provided in the catalog",
+    "provided by the entry",
+    "provided in the entry",
+    "given by the label",
+    "given in the label",
+    "given by the reference",
+    "given in the reference",
+    "given by the details",
+    "given in the details",
+    "given by the catalog",
+    "given in the catalog",
+    "given by the entry",
+    "given in the entry",
+    "supplied by the label",
+    "supplied in the label",
+    "supplied by the reference",
+    "supplied in the reference",
+    "supplied by the details",
+    "supplied in the details",
+    "supplied by the catalog",
+    "supplied in the catalog",
+    "supplied by the entry",
+    "supplied in the entry",
+    "attached to the label",
+    "attached to the reference",
+    "attached to the details",
+    "attached to the catalog",
+    "attached to the entry",
+    "given technique description",
+    "provided technique description",
+    "supplied technique description",
+    "given attack technique description",
+    "provided attack technique description",
+    "supplied attack technique description",
+    "given tactic description",
+    "provided tactic description",
+    "supplied tactic description",
+    "given mitigation description",
+    "provided mitigation description",
+    "supplied mitigation description",
+    "given attack pattern description",
+    "provided attack pattern description",
+    "supplied attack pattern description",
+    "given cwe description",
+    "provided cwe description",
+    "supplied cwe description",
+    "given cvss description",
+    "provided cvss description",
+    "supplied cvss description",
+    "given technique list",
+    "provided technique list",
+    "supplied technique list",
+    "given attack technique list",
+    "provided attack technique list",
+    "supplied attack technique list",
+    "given tactic list",
+    "provided tactic list",
+    "supplied tactic list",
+    "given mitigation list",
+    "provided mitigation list",
+    "supplied mitigation list",
+    "given attack pattern list",
+    "provided attack pattern list",
+    "supplied attack pattern list",
+    "given cwe list",
+    "provided cwe list",
+    "supplied cwe list",
+    "given cvss vector",
+    "provided cvss vector",
+    "supplied cvss vector",
+    "given cvss score",
+    "provided cvss score",
+    "supplied cvss score",
+    "given technique id",
+    "provided technique id",
+    "supplied technique id",
+    "given attack technique id",
+    "provided attack technique id",
+    "supplied attack technique id",
+    "given tactic id",
+    "provided tactic id",
+    "supplied tactic id",
+    "given mitigation id",
+    "provided mitigation id",
+    "supplied mitigation id",
+    "given cwe id",
+    "provided cwe id",
+    "supplied cwe id",
+    "given attack pattern id",
+    "provided attack pattern id",
+    "supplied attack pattern id",
+    "candidate pool",
+    "option list",
+    "options list",
+    "provided options",
+    "given options",
+    "supplied options",
+    "options provided",
+    "options given",
+    "options supplied",
+    "list of options",
+    "list of candidates",
+    "candidate list",
+    "choices list",
+    "above options",
+    "below options",
+    "the options above",
+    "the options below",
+    "the list above",
+    "the list below",
+    "the provided list",
+    "the given list",
+    "the supplied list",
+    "the candidate list",
+    "the candidates provided",
+    "the candidates given",
+    "the candidates supplied",
+    "from the provided list",
+    "from the given list",
+    "from the supplied list",
+    "based on the provided list",
+    "based on the given list",
+    "based on the supplied list",
+    "using the provided list",
+    "using the given list",
+    "using the supplied list",
+]
+
+DEFAULT_BANNED_REGEXES = [
+    r"\blabels?\s+(references?|details?|descriptions?|texts?)\b",
+    r"\blabels?[-_ ]references?\b",
+    r"\b(references?|details?|manifestations?)\b.{0,80}\b(given|provided|supplied|attached)\b",
+    r"\b(given|provided|supplied|attached)\b.{0,80}\b(references?|details?|manifestations?)\b",
+    r"\b(labels?|answers?|options?|candidate pools?|candidate lists?|choices?)\b.{0,80}\b(given|provided|supplied|attached)\b",
+    r"\b(given|provided|supplied|attached)\b.{0,80}\b(labels?|answers?|options?|candidate pools?|candidate lists?|choices?)\b",
+    r"\b(labels?|references?|details?|manifestations?)\b.{0,80}\b(says|states|notes|indicates|mentions|describes|shows|matches|aligns|corresponds)\b",
+    r"\b(says|states|notes|indicates|mentions|describes|shows|matches|aligns|corresponds)\b.{0,80}\b(labels?|references?|details?|manifestations?)\b",
+    r"\b(entr(?:y|ies)|catalogs?)\b.{0,80}\b(says|states|notes|indicates|mentions|describes|shows|lists|matches|aligns|corresponds)\b",
+    r"\b(says|states|notes|indicates|mentions|describes|shows|lists|matches|aligns|corresponds)\b.{0,80}\b(entr(?:y|ies)|catalogs?)\b",
+    r"\b(the )?(entr(?:y|ies)|catalogs?)\b.{0,80}\b(for|about)\b.{0,40}\b(technique|tactic|mitigation|attack pattern|attack technique|cwe|cvss|capec)\b",
+    r"\b(according to|based on|as stated in|as noted in|as described in|per)\b.{0,80}\b(labels?|references?|details?|manifestations?)\b",
+    r"\b(labels?|references?|details?|manifestations?)\b.{0,80}\b(according to|based on|as stated in|as noted in|as described in|per)\b",
+    r"\b(this|it)\b.{0,20}\b(matches|aligns with|corresponds to|comes from)\b.{0,40}\b(labels?|references?|details?|manifestations?)\b",
+    r"\b(labels?|references?|details?|manifestations?)\b.{0,40}\b(matches|aligns with|corresponds to|comes from)\b",
+    r"\b(as listed in|as shown in|as stated in|as noted in|per)\b.{0,80}\b(entr(?:y|ies)|catalogs?|labels?|references?|details?|manifestations?)\b",
+    r"\b(entr(?:y|ies)|catalogs?|labels?|references?|details?|manifestations?)\b.{0,80}\b(as listed in|as shown in|as stated in|as noted in|per)\b",
+    r"\b(above|below|following)\b.{0,40}\b(options?|lists?|candidates?|choices?)\b",
+    r"\b(options?|lists?|candidates?|choices?)\b.{0,40}\b(above|below|following)\b",
+    r"\b(technique|tactic|mitigation|attack pattern|attack technique|cwe|cvss|capec)\s+(descriptions?|lists?|ids?|vectors?|scores?)\b.{0,80}\b(given|provided|supplied|attached)\b",
+    r"\b(given|provided|supplied|attached)\b.{0,80}\b(technique|tactic|mitigation|attack pattern|attack technique|cwe|cvss|capec)\s+(descriptions?|lists?|ids?|vectors?|scores?)\b",
 ]
 
 _ID_REGEX = re.compile(r"\b(?:T\d{4}(?:\.\d{3})?|TA\d{4}|M\d{4}|DET-?\d{4}|CWE-\d+|CAPEC-\d+)\b", re.IGNORECASE)
@@ -111,6 +423,122 @@ def _split_reasoning(output: str) -> str:
     return output.strip()
 
 
+_WORD_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_DESCRIPTION_MARKER_RE = re.compile(
+    r"(adversary procedure|cve description|vulnerability description|sigma rule excerpt)\s*:",
+    re.IGNORECASE,
+)
+_DESCRIPTION_STOP_RE = re.compile(
+    r"^\s*(primary impact|valid mitre|options|answer format|requirements)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _word_tokens(text: str) -> list[str]:
+    if not text:
+        return []
+    return [tok.lower() for tok in _WORD_TOKEN_RE.findall(text)]
+
+
+def _content_tokens(text: str) -> list[str]:
+    if not text:
+        return []
+    tokens = _word_tokens(text)
+    return [tok for tok in tokens if len(tok) >= 3 and not _ID_REGEX.match(tok.upper())]
+
+
+def _extract_task_description_from_text(text: str) -> str:
+    if not text:
+        return ""
+    matches = list(_DESCRIPTION_MARKER_RE.finditer(text))
+    if not matches:
+        return ""
+    start = matches[-1].end()
+    section = text[start:]
+    stop = _DESCRIPTION_STOP_RE.search(section)
+    if stop:
+        section = section[: stop.start()]
+    return section.strip()
+
+
+def _extract_task_description(extra_info: Optional[dict]) -> str:
+    if not isinstance(extra_info, dict):
+        return ""
+    for key in ("acr_orig_prompt", "orig_prompt", "raw_prompt", "prompt"):
+        payload = extra_info.get(key)
+        if isinstance(payload, list):
+            content = ""
+            for msg in reversed(payload):
+                if not isinstance(msg, dict):
+                    continue
+                msg_content = msg.get("content")
+                if not isinstance(msg_content, str):
+                    continue
+                role = str(msg.get("role") or "").lower()
+                if role == "user":
+                    content = msg_content
+                    break
+                if not content:
+                    content = msg_content
+            if content:
+                desc = _extract_task_description_from_text(content)
+                if desc:
+                    return desc
+        elif isinstance(payload, str):
+            desc = _extract_task_description_from_text(payload)
+            if desc:
+                return desc
+    return ""
+
+
+def _jaccard(tokens_a: list[str], tokens_b: list[str]) -> Optional[float]:
+    if not tokens_a or not tokens_b:
+        return None
+    set_a = set(tokens_a)
+    set_b = set(tokens_b)
+    if not set_a or not set_b:
+        return None
+    denom = len(set_a | set_b)
+    if denom <= 0:
+        return None
+    return len(set_a & set_b) / denom
+
+
+def _extract_label_reference_from_text(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"label_reference\s*:", text, re.IGNORECASE)
+    if not match:
+        return ""
+    rest = text[match.end() :]
+    stop = re.search(r"^\s*instructions\s*:", rest, re.IGNORECASE | re.MULTILINE)
+    if stop:
+        rest = rest[: stop.start()]
+    return rest.strip()
+
+
+def _extract_label_reference(extra_info: Optional[dict]) -> str:
+    if not isinstance(extra_info, dict):
+        return ""
+    for key in ("acr_prompt", "raw_prompt", "prompt"):
+        payload = extra_info.get(key)
+        if isinstance(payload, list):
+            for msg in payload:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, str):
+                    continue
+                details = _extract_label_reference_from_text(content)
+                if details:
+                    return details
+        elif isinstance(payload, str):
+            details = _extract_label_reference_from_text(payload)
+            if details:
+                return details
+    return ""
+
+
 def _match_labels(gold: list[str], pred: list[str], policy: str) -> bool:
     if not gold or not pred:
         return False
@@ -124,8 +552,18 @@ def _match_labels(gold: list[str], pred: list[str], policy: str) -> bool:
     return gold_set == pred_set
 
 
-def _contains_banned_phrase(text: str, phrases: Iterable[str], *, fuzzy: bool, threshold: float) -> bool:
+def _contains_banned_phrase(
+    text: str,
+    phrases: Iterable[str],
+    *,
+    regexes: Optional[Iterable[str]] = None,
+    fuzzy: bool,
+    threshold: float,
+) -> bool:
     norm = _normalize_text(text)
+    for pattern in regexes or []:
+        if re.search(pattern, norm, re.IGNORECASE):
+            return True
     for phrase in phrases:
         p_norm = _normalize_text(phrase)
         if not p_norm:
@@ -156,6 +594,18 @@ def _id_leak_in_reasoning(reasoning: str, gold_labels: Iterable[str]) -> bool:
     return False
 
 
+def _count_id_mentions(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not text:
+        return counts
+    for match in _ID_REGEX.findall(text):
+        norm = _normalize_label(match)
+        if not norm:
+            continue
+        counts[norm] = counts.get(norm, 0) + 1
+    return counts
+
+
 def reward_acr(
     data_source: str,
     solution_str: str,
@@ -166,9 +616,13 @@ def reward_acr(
     leak_penalty: float = 0.5,
     multilabel_match: str = "exact",
     banned_phrases: Optional[list[str]] = None,
-    use_fuzzy_leak_check: bool = True,
+    banned_regexes: Optional[list[str]] = None,
+    use_fuzzy_leak_check: bool = False,
     fuzzy_threshold: float = 0.85,
     enforce_no_id_in_reasoning: bool = True,
+    max_id_mentions: Optional[int] = 3,
+    min_reasoning_chars: int = 100,
+    min_overlap_jaccard: float = 0.05,
     score_min: Optional[float] = None,
     score_max: Optional[float] = None,
 ) -> dict:
@@ -190,12 +644,53 @@ def reward_acr(
         is_correct = base_score >= 1.0 - 1e-6
 
     phrases = banned_phrases if banned_phrases is not None else DEFAULT_BANNED_PHRASES
-    leak_hit = _contains_banned_phrase(solution_str or "", phrases, fuzzy=use_fuzzy_leak_check, threshold=fuzzy_threshold)
+    regexes = banned_regexes if banned_regexes is not None else DEFAULT_BANNED_REGEXES
+    banned_hit = _contains_banned_phrase(
+        solution_str or "",
+        phrases,
+        regexes=regexes,
+        fuzzy=use_fuzzy_leak_check,
+        threshold=fuzzy_threshold,
+    )
+    leak_hit = bool(banned_hit)
+
+    reasoning = _split_reasoning(solution_str or "")
+    short_hit = False
+    if min_reasoning_chars and len(reasoning.strip()) < int(min_reasoning_chars):
+        short_hit = True
+        leak_hit = True
 
     id_leak_hit = False
     if enforce_no_id_in_reasoning and gold_labels:
-        reasoning = _split_reasoning(solution_str or "")
         id_leak_hit = _id_leak_in_reasoning(reasoning, gold_labels)
+
+    details_text = _extract_label_reference(extra_info)
+
+    overlap_hit = False
+    overlap_score = None
+    task_description = _extract_task_description(extra_info)
+    combined_text = "\n\n".join([part for part in (task_description, details_text) if part])
+    if combined_text and reasoning:
+        overlap_score = _jaccard(_content_tokens(combined_text), _content_tokens(reasoning))
+        if overlap_score is not None and overlap_score < float(min_overlap_jaccard):
+            overlap_hit = True
+            leak_hit = True
+
+    id_overuse_hit = False
+    id_overuse_max = 0
+    if max_id_mentions is not None and max_id_mentions > 0 and gold_labels:
+        counts = _count_id_mentions(solution_str or "")
+        for label in gold_labels:
+            if not _ID_REGEX.match(label):
+                continue
+            count = counts.get(_normalize_label(label), 0)
+            if count > id_overuse_max:
+                id_overuse_max = count
+            if count > max_id_mentions:
+                id_overuse_hit = True
+                break
+    if id_overuse_hit:
+        leak_hit = True
 
     score = 0.0
     if extracted and base_score > 0:
@@ -208,16 +703,23 @@ def reward_acr(
     if score_max is not None:
         score = min(score, float(score_max))
 
-    return {
+    result = {
         "score": float(score),
         "acr_base_score": float(base_score),
         "acr_extracted": bool(extracted),
         "acr_is_correct": bool(is_correct),
         "acr_leak_hit": bool(leak_hit),
+        "acr_banned_phrase_hit": bool(banned_hit),
         "acr_id_leak_hit": bool(id_leak_hit),
+        "acr_short_hit": bool(short_hit),
+        "acr_overlap_hit": bool(overlap_hit),
         "acr_pred_labels": pred_labels,
         "acr_gold_labels": gold_labels,
     }
+    if max_id_mentions is not None and max_id_mentions > 0:
+        result["acr_id_overuse_hit"] = bool(id_overuse_hit)
+        result["acr_id_overuse_max"] = int(id_overuse_max)
+    return result
 
 
 __all__ = ["reward_acr"]
