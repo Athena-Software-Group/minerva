@@ -57,6 +57,24 @@ PULL_LFS=0 bash scripts/setup_repo.sh
 
 The lower-level env-only script still exists at `scripts/setup_rlvr_env.sh`, but `scripts/setup_repo.sh` is the default entrypoint for this repo.
 
+## Qwen3.5 Branch
+
+`Qwen/Qwen3.5-4B` support is maintained on the `qwen3.5` branch, not on `main`.
+
+That branch contains:
+
+- the updated `vllm` and `transformers` setup path
+- the isolated Qwen3.5 environment bootstrap
+- the Qwen3.5 launchers for Minerva-Noctua, plain GRPO, and DART SFT
+
+To use it:
+
+```bash
+git switch qwen3.5
+bash scripts/setup_qwen35_repo.sh
+source .venv-qwen35/bin/activate
+```
+
 ## Checked-In Runtime Data
 
 The repo already includes the runtime datasets used by the training scripts:
