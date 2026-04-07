@@ -6,10 +6,11 @@ This document describes the current TARBA implementation and configuration used 
 - Multi-turn RL training with an optional CTI retrieval tool.
 - Per-task controller anneals retrieval availability over training.
 - Retrieval reward shaping uses a linear decay with a floor.
-- Training entrypoint: `rlvr/cti-scripts/train_minerva_tarba_llama3b.sh`.
-- Qwen3 4B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_qwen4b.sh`.
-- Llama 8B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_llama8b.sh`.
-- Qwen3 8B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_qwen8b.sh`.
+- TARBA launchers are archived on `main` under `rlvr/old-cti-scripts/`.
+- Training entrypoint: `rlvr/old-cti-scripts/train_minerva_tarba_llama3b.sh`.
+- Qwen3 4B entrypoint: `rlvr/old-cti-scripts/train_minerva_tarba_qwen4b.sh`.
+- Llama 8B entrypoint: `rlvr/old-cti-scripts/train_minerva_tarba_llama8b.sh`.
+- Qwen3 8B entrypoint: `rlvr/old-cti-scripts/train_minerva_tarba_qwen8b.sh`.
 
 ## High-level flow
 1) TARBA wraps each CTI sample with optional tool instructions that let the model request retrieval once using a short JSON query (hidden tool schema mode).

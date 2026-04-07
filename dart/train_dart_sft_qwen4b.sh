@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export SFT_MODEL_PATH="${SFT_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
-exec "$(dirname "$0")/train_dart_sft_llama3b.sh" "$@"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$REPO_ROOT/rlvr/cti-scripts/train_minerva_sft_qwen4b.sh" "$@"

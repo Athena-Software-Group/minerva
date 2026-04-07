@@ -21,12 +21,4 @@ fi
 export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-dart_sft_${MODEL_SLUG}}"
 export SFT_OUTPUT_ROOT="${SFT_OUTPUT_ROOT:-$REPO_ROOT/rlvr/checkpoints/dart/$SFT_EXPERIMENT_NAME}"
 
-exec "$REPO_ROOT/rlvr/cti-scripts/train_minerva_sft.sh" \
-  model.strategy=fsdp \
-  model.fsdp_config.model_dtype=bfloat16 \
-  model.enable_gradient_checkpointing=true \
-  trainer.max_ckpt_to_keep=1 \
-  trainer.checkpoint.save_contents='["hf_model"]' \
-  trainer.checkpoint.load_contents='[]' \
-  trainer.logger='["console", "wandb"]' \
-  "$@"
+exec "$REPO_ROOT/rlvr/cti-scripts/train_minerva_sft_llama3b.sh" "$@"

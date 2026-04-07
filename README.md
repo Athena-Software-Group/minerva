@@ -15,9 +15,11 @@ The repo has three main pieces:
   - main entrypoints: `minerva/pipeline.py`, `minerva/split.py`
 - `rlvr/`
   - VeRL-based training stack
-  - main launchers live under `rlvr/cti-scripts/`
+  - `rlvr/cti-scripts/` contains the 12 supported top-level training launchers
+  - `rlvr/cti-scripts/_shared/` contains shared launcher internals
+  - `rlvr/old-cti-scripts/` contains archived or experimental launchers
 - `dart/`
-  - DART SFT launchers for the checked-in 64k fixed dataset
+  - compatibility wrappers for the checked-in 64k DART SFT dataset
 - `dataset/`
   - checked-in runtime assets needed by training, including `label_details/` and the TextCNN filter model
 - `rlvr/mydata/`
@@ -99,26 +101,36 @@ The repo already includes the runtime datasets used by the training scripts:
 
 ## Training
 
-### 1. Minerva-Noctua
+`rlvr/cti-scripts/` now contains exactly 12 supported top-level launchers:
+
+- 4 Minerva-Noctua launchers
+- 4 plain GRPO launchers
+- 4 DART SFT launchers
+
+### 1. Minerva-Noctua (MinervaRL)
 
 Main launchers:
 
 - `rlvr/cti-scripts/train_minerva_noctua_llama3b.sh`
+- `rlvr/cti-scripts/train_minerva_noctua_llama8b.sh`
 - `rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh`
 - `rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh`
 
-Example:
+Commands:
 
 ```bash
 source .venv/bin/activate
 bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh
+bash rlvr/cti-scripts/train_minerva_noctua_llama8b.sh
+bash rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh
+bash rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh
 ```
 
 Notes:
 
 - Noctua uses the checked-in Minerva RL train parquet, Athena validation parquets, `dataset/label_details/`, and the checked-in TextCNN filter model.
 - The Noctua path defaults to `4` GPUs in this repo.
-- The core launcher is `rlvr/cti-scripts/train_minerva_noctua.sh`.
+- The shared Noctua implementation lives under `rlvr/cti-scripts/_shared/`.
 
 10-step smoke-test example:
 
@@ -141,11 +153,14 @@ Main launchers:
 - `rlvr/cti-scripts/train_minerva_base_qwen4b.sh`
 - `rlvr/cti-scripts/train_minerva_base_qwen8b.sh`
 
-Example:
+Commands:
 
 ```bash
 source .venv/bin/activate
 bash rlvr/cti-scripts/train_minerva_base_llama3b.sh trainer.n_gpus_per_node=4
+bash rlvr/cti-scripts/train_minerva_base_llama8b.sh trainer.n_gpus_per_node=4
+bash rlvr/cti-scripts/train_minerva_base_qwen4b.sh trainer.n_gpus_per_node=4
+bash rlvr/cti-scripts/train_minerva_base_qwen8b.sh trainer.n_gpus_per_node=4
 ```
 
 Notes:
@@ -171,23 +186,27 @@ bash rlvr/cti-scripts/train_minerva_base_llama3b.sh \
 
 Main launchers:
 
-- `dart/train_dart_sft_llama3b.sh`
-- `dart/train_dart_sft_llama8b.sh`
-- `dart/train_dart_sft_qwen4b.sh`
-- `dart/train_dart_sft_qwen8b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_llama3b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_llama8b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_qwen4b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_qwen8b.sh`
 
-Example:
+Commands:
 
 ```bash
 source .venv/bin/activate
-bash dart/train_dart_sft_llama3b.sh
+bash rlvr/cti-scripts/train_minerva_sft_llama3b.sh
+bash rlvr/cti-scripts/train_minerva_sft_llama8b.sh
+bash rlvr/cti-scripts/train_minerva_sft_qwen4b.sh
+bash rlvr/cti-scripts/train_minerva_sft_qwen8b.sh
 ```
 
 Notes:
 
 - SFT uses the checked-in DART 64k train parquet in `rlvr/mydata/sft/`.
 - Validation loss is computed on the checked-in DART `minerva_dev` and `athena_bench` validation parquets in the same directory.
-- The shared SFT launcher is `rlvr/cti-scripts/train_minerva_sft.sh`.
+- The shared SFT implementation lives under `rlvr/cti-scripts/_shared/`.
+- The `dart/` wrappers remain as compatibility aliases, but `rlvr/cti-scripts/` is the canonical entrypoint location.
 
 10-step smoke-test example:
 
@@ -202,7 +221,7 @@ SFT_N_GPUS_PER_NODE=4 \
 SFT_RESUME_MODE=disable \
 SFT_TRAIN_BATCH_SIZE=64 \
 SFT_MICRO_BATCH_SIZE_PER_GPU=4 \
-bash dart/train_dart_sft_llama3b.sh
+bash rlvr/cti-scripts/train_minerva_sft_llama3b.sh
 ```
 
 ## Creating Minerva Training Data

@@ -12,11 +12,14 @@
   - dataset builder, task builders, prompts, reward helpers
   - main entrypoints: `minerva/pipeline.py`, `minerva/split.py`
 - `rlvr/cti-scripts/`
-  - primary training launchers for plain GRPO, Noctua, ACRD variants, TARBA, and shared SFT
+  - exactly 12 supported top-level launchers:
+    plain GRPO (4), Minerva-Noctua (4), and DART SFT (4)
+  - shared shell helpers live under `rlvr/cti-scripts/_shared/`
+  - archived or experimental launchers live under `rlvr/old-cti-scripts/`
 - `rlvr/verl/`
   - trainer, worker, reward, checkpoint, and dataset plumbing used by the launchers
 - `dart/`
-  - model-specific DART SFT wrappers that call `rlvr/cti-scripts/train_minerva_sft.sh`
+  - compatibility wrappers for the canonical SFT launchers in `rlvr/cti-scripts/`
 - `dataset/`
   - checked-in runtime assets only
   - currently kept: `dataset/minerva_base_split/`, `dataset/label_details/`, `dataset/models/`
@@ -72,8 +75,10 @@
 
 ## Supported training paths
 - Minerva-Noctua:
-  - shared launcher: `rlvr/cti-scripts/train_minerva_noctua.sh`
-  - common wrappers: `train_minerva_noctua_llama3b.sh`, `train_minerva_noctua_qwen4b.sh`, `train_minerva_noctua_qwen8b.sh`
+  - model launchers:
+    `train_minerva_noctua_llama3b.sh`, `train_minerva_noctua_llama8b.sh`,
+    `train_minerva_noctua_qwen4b.sh`, `train_minerva_noctua_qwen8b.sh`
+  - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_noctua.sh`
   - uses GRPO, ACR/ACRD, label details, and the local TextCNN model
   - rollout backend is `vllm`
 - Plain GRPO:
@@ -84,10 +89,12 @@
   - uses `algorithm.adv_estimator=grpo` and `reward_minerva.py`
   - rollout backend is `vllm`
 - DART SFT:
-  - shared launcher: `rlvr/cti-scripts/train_minerva_sft.sh`
-  - model wrappers under `dart/`
+  - model launchers:
+    `train_minerva_sft_llama3b.sh`, `train_minerva_sft_llama8b.sh`,
+    `train_minerva_sft_qwen4b.sh`, `train_minerva_sft_qwen8b.sh`
+  - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_sft.sh`
   - fixed train/validation data comes from `rlvr/mydata/sft/`
-- Secondary or legacy paths still exist in the tree, but the repo-level supported flows are Noctua, plain GRPO, and DART SFT.
+- Secondary or legacy ACRD/TARBA paths are archived under `rlvr/old-cti-scripts/`.
 
 ## Rebuilding Minerva training data
 - This repo no longer keeps the full raw dataset caches by default.

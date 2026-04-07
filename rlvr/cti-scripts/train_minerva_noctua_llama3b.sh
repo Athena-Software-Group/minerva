@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACRD training script for Llama 8B (distill lr_scale=0.05, flush buffer, batch size 256,
+# Minerva-Noctua launcher for Llama 3.2 3B (distill lr_scale=0.05, flush buffer, batch size 256,
 # TextCNN ML+heuristic filter, deferred ACR generation, EMA teacher alpha 0.995,
 # ACR rollout temperature 0.7, top_p 0.9).
 
@@ -32,4 +32,4 @@ if [ -z "$MODEL_SLUG" ]; then
 fi
 export ACRD_EXPERIMENT_NAME="${ACRD_EXPERIMENT_NAME:-minerva_noctua_${MODEL_SLUG}_lr0.05_flush_bs256_mlh_t0.7_p0.9_defer_ema}"
 
-exec "$(dirname "$0")/train_minerva_noctua.sh" "$@"
+exec "$(dirname "$0")/_shared/train_minerva_noctua.sh" "$@"
