@@ -29,4 +29,4 @@ if [ -z "$MODEL_SLUG" ]; then
 fi
 export ACRD_EXPERIMENT_NAME="${ACRD_EXPERIMENT_NAME:-minerva_noctua_${MODEL_SLUG}_lr0.05_flush_bs256_t0.7_p0.9_defer_ema_filteroff}"
 
-exec "$(dirname "$0")/train_minerva_noctua.sh" "$@"
+exec "$(dirname "$0")/../../cti-scripts/_shared/train_minerva_noctua.sh" "$@"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ACRD_MODEL_PATH="${ACRD_MODEL_PATH:-Qwen/Qwen3.5-4B}"
+export ACRD_MODEL_PATH="${ACRD_MODEL_PATH:-Qwen/Qwen3.5-4B-Base}"
 export ACRD_ACR_ROLLOUT_N="${ACRD_ACR_ROLLOUT_N:-4}"
 export ACRD_ACR_DISTILL_LR_SCALE="${ACRD_ACR_DISTILL_LR_SCALE:-0.05}"
 export ACRD_ACR_DISTILL_BUFFER_MODE="${ACRD_ACR_DISTILL_BUFFER_MODE:-flush}"
@@ -36,7 +36,7 @@ if [ -z "$MODEL_SLUG" ]; then
 fi
 export ACRD_EXPERIMENT_NAME="${ACRD_EXPERIMENT_NAME:-minerva_noctua_${MODEL_SLUG}_lr0.05_flush_bs256_mlh_t0.7_p0.9_defer_ema}"
 
-exec "$(dirname "$0")/train_minerva_noctua.sh" \
+exec "$(dirname "$0")/_shared/train_minerva_noctua.sh" \
   +actor_rollout_ref.model.force_causal_lm="$ACRD_FORCE_CAUSAL_LM" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.max_model_len="$ACRD_ROLLOUT_MAX_MODEL_LEN" \

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Training script for Minerva Base GRPO with Qwen3.5 4B.
+# Training script for Minerva Base GRPO with Qwen3.5 4B Base.
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$ROOT_DIR/mydata"
+MODEL_PATH="${MINERVA_BASE_MODEL_PATH:-Qwen/Qwen3.5-4B-Base}"
+ROLLOUT_GPU_UTIL="${MINERVA_BASE_ROLLOUT_GPU_UTIL:-0.8}"
+EXPERIMENT_NAME="${MINERVA_BASE_EXPERIMENT_NAME:-minerva_base_grpo_qwen35_4b}"
 
 export WANDB_START_METHOD=thread
 export WANDB_DISABLE_SERVICE=true
@@ -36,7 +39,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=Qwen/Qwen3.5-4B \
+    actor_rollout_ref.model.path="$MODEL_PATH" \
     +actor_rollout_ref.model.force_causal_lm=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -51,7 +54,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_UTIL" \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
@@ -64,7 +67,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name='minerva' \
-    trainer.experiment_name='minerva_base_grpo_qwen35_4b' \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \

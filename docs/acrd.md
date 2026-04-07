@@ -270,19 +270,20 @@ Uses `acr_prompt` when available; falls back to `orig_prompt` for older buffers.
 
 ---
 
-### 6) Per-batch training script (cti-scripts)
-Use the single entrypoint `rlvr/cti-scripts/train_minerva_acrd.sh` to run RLVR -> ACR -> SFT
-in a single PPO job (same batch per iteration). Model-specific wrappers are provided:
+### 6) Per-batch training script (archived ACRD wrappers)
+On the `qwen3.5` branch, the supported ACRD path is exposed through the Minerva-Noctua
+launchers in `rlvr/cti-scripts/`. The older `train_minerva_acrd*.sh` wrappers were archived
+under `rlvr/old-cti-scripts/qwen35-archive/`.
 
-- `rlvr/cti-scripts/train_minerva_acrd_llama3b.sh`
-- `rlvr/cti-scripts/train_minerva_acrd_llama8b.sh`
-- `rlvr/cti-scripts/train_minerva_acrd_qwen4b.sh`
-- `rlvr/cti-scripts/train_minerva_acrd_qwen8b.sh`
+Supported model entrypoints on this branch:
+
+- `rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh`
+- `rlvr/cti-scripts/train_minerva_noctua_qwen35_9b.sh`
 
 Example:
 
 ```bash
-rlvr/cti-scripts/train_minerva_acrd.sh
+bash rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh
 ```
 
 Key env overrides:
@@ -306,8 +307,8 @@ trainer flow is the preferred path for ACRD.
 ---
 
 ### 8) Configs
-Use `configs/acr_rl.yaml` for standalone ACR-only runs, or rely on the per-batch overrides
-from `rlvr/cti-scripts/train_minerva_acrd.sh`.
+Use `configs/acr_rl.yaml` for standalone ACR-only runs, or rely on the archived per-batch
+overrides from `rlvr/old-cti-scripts/qwen35-archive/train_minerva_acrd.sh`.
 
 Standalone ACR example:
 

@@ -15,9 +15,11 @@ The repo has three main pieces:
   - main entrypoints: `minerva/pipeline.py`, `minerva/split.py`
 - `rlvr/`
   - VeRL-based training stack
-  - main launchers live under `rlvr/cti-scripts/`
+  - `rlvr/cti-scripts/` contains the 6 supported Qwen3.5 launchers on this branch
+  - `rlvr/cti-scripts/_shared/` contains shared launcher internals
+  - `rlvr/old-cti-scripts/qwen35-archive/` contains archived non-Qwen3.5 launchers
 - `dart/`
-  - DART SFT launchers for the checked-in 64k fixed dataset
+  - compatibility wrappers for the checked-in 64k DART SFT dataset
 - `dataset/`
   - checked-in runtime assets needed by training, including `label_details/` and the TextCNN filter model
 - `rlvr/mydata/`
@@ -33,16 +35,16 @@ Requirements:
 - CUDA-capable PyTorch environment
 - `git-lfs`
 
-Run the repo bootstrap script:
+Run the Qwen3.5 repo bootstrap script:
 
 ```bash
-bash scripts/setup_repo.sh
-source .venv/bin/activate
+bash scripts/setup_qwen35_repo.sh
+source .venv-qwen35/bin/activate
 ```
 
 What this does:
 
-- creates or recreates `.venv`
+- creates or recreates `.venv-qwen35`
 - installs the RLVR-based Python environment from `requirements-rlvr-minerva.txt`
 - installs `flash-attn`
 - runs `git lfs install`
@@ -51,15 +53,15 @@ What this does:
 Useful options:
 
 ```bash
-RECREATE_VENV=0 bash scripts/setup_repo.sh
-PULL_LFS=0 bash scripts/setup_repo.sh
+RECREATE_VENV=0 bash scripts/setup_qwen35_repo.sh
+PULL_LFS=0 bash scripts/setup_qwen35_repo.sh
 ```
 
-The lower-level env-only script still exists at `scripts/setup_rlvr_env.sh`, but `scripts/setup_repo.sh` is the default entrypoint for this repo.
+The lower-level env-only script still exists at `scripts/setup_rlvr_env.sh`, but `scripts/setup_qwen35_repo.sh` is the default entrypoint for this branch.
 
 ### Qwen3.5 Setup
 
-`Qwen/Qwen3.5-4B` needs the newer `vllm` and `transformers` stack already wired into this branch. The cleanest path is to keep it in its own venv:
+This branch is for `Qwen/Qwen3.5-4B-Base` and `Qwen/Qwen3.5-9B-Base`. It uses the newer `vllm` and `transformers` stack already wired into this branch.
 
 ```bash
 bash scripts/setup_qwen35_repo.sh
@@ -92,36 +94,42 @@ The repo already includes the runtime datasets used by the training scripts:
 
 ## Training
 
-### 1. Minerva-Noctua
+`rlvr/cti-scripts/` now contains exactly 6 supported top-level launchers on this branch:
+
+- 2 Minerva-Noctua (MinervaRL) launchers
+- 2 plain GRPO launchers
+- 2 DART SFT launchers
+
+### 1. Minerva-Noctua (MinervaRL)
 
 Main launchers:
 
-- `rlvr/cti-scripts/train_minerva_noctua_llama3b.sh`
 - `rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh`
-- `rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh`
-- `rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh`
+- `rlvr/cti-scripts/train_minerva_noctua_qwen35_9b.sh`
 
-Example:
+Commands:
 
 ```bash
-source .venv/bin/activate
-bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh
+source .venv-qwen35/bin/activate
+bash rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh
+bash rlvr/cti-scripts/train_minerva_noctua_qwen35_9b.sh
 ```
 
 Notes:
 
 - Noctua uses the checked-in Minerva RL train parquet, Athena validation parquets, `dataset/label_details/`, and the checked-in TextCNN filter model.
 - The Noctua path defaults to `4` GPUs in this repo.
-- The core launcher is `rlvr/cti-scripts/train_minerva_noctua.sh`.
+- The shared Noctua implementation lives under `rlvr/cti-scripts/_shared/`.
 - The verified Qwen3.5 path uses `vllm` and defaults EMA-teacher distillation off in `train_minerva_noctua_qwen35_4b.sh`. The 10-step smoke test on this branch used that default and saved a checkpoint successfully.
+- `train_minerva_noctua_qwen35_9b.sh` mirrors the same Qwen3.5 vLLM stack with the 9B Base model and a lower default rollout GPU-utilization.
 
 10-step smoke-test example:
 
 ```bash
-source .venv/bin/activate
+source .venv-qwen35/bin/activate
 WANDB_MODE=offline \
-ACRD_EXPERIMENT_NAME=smoke_noctua_llama3b_10steps \
-bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh \
+ACRD_EXPERIMENT_NAME=smoke_noctua_qwen35_4b_10steps \
+bash rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh \
   trainer.total_training_steps=10 \
   trainer.save_freq=10 \
   trainer.test_freq=10
@@ -131,17 +139,15 @@ bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh \
 
 Main launchers:
 
-- `rlvr/cti-scripts/train_minerva_base_llama3b.sh`
-- `rlvr/cti-scripts/train_minerva_base_llama8b.sh`
 - `rlvr/cti-scripts/train_minerva_base_qwen35_4b.sh`
-- `rlvr/cti-scripts/train_minerva_base_qwen4b.sh`
-- `rlvr/cti-scripts/train_minerva_base_qwen8b.sh`
+- `rlvr/cti-scripts/train_minerva_base_qwen35_9b.sh`
 
-Example:
+Commands:
 
 ```bash
-source .venv/bin/activate
-bash rlvr/cti-scripts/train_minerva_base_llama3b.sh trainer.n_gpus_per_node=4
+source .venv-qwen35/bin/activate
+bash rlvr/cti-scripts/train_minerva_base_qwen35_4b.sh trainer.n_gpus_per_node=4
+bash rlvr/cti-scripts/train_minerva_base_qwen35_9b.sh trainer.n_gpus_per_node=4
 ```
 
 Notes:
@@ -154,9 +160,9 @@ Notes:
 10-step smoke-test example:
 
 ```bash
-source .venv/bin/activate
+source .venv-qwen35/bin/activate
 WANDB_MODE=offline \
-bash rlvr/cti-scripts/train_minerva_base_llama3b.sh \
+bash rlvr/cti-scripts/train_minerva_base_qwen35_4b.sh \
   trainer.n_gpus_per_node=4 \
   trainer.total_training_steps=10 \
   trainer.save_freq=10 \
@@ -167,29 +173,28 @@ bash rlvr/cti-scripts/train_minerva_base_llama3b.sh \
 
 Main launchers:
 
-- `dart/train_dart_sft_llama3b.sh`
-- `dart/train_dart_sft_llama8b.sh`
-- `dart/train_dart_sft_qwen35_4b.sh`
-- `dart/train_dart_sft_qwen4b.sh`
-- `dart/train_dart_sft_qwen8b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_qwen35_4b.sh`
+- `rlvr/cti-scripts/train_minerva_sft_qwen35_9b.sh`
 
-Example:
+Commands:
 
 ```bash
-source .venv/bin/activate
-bash dart/train_dart_sft_llama3b.sh
+source .venv-qwen35/bin/activate
+bash rlvr/cti-scripts/train_minerva_sft_qwen35_4b.sh
+bash rlvr/cti-scripts/train_minerva_sft_qwen35_9b.sh
 ```
 
 Notes:
 
 - SFT uses the checked-in DART 64k train parquet in `rlvr/mydata/sft/`.
 - Validation loss is computed on the checked-in DART `minerva_dev` and `athena_bench` validation parquets in the same directory.
-- The shared SFT launcher is `rlvr/cti-scripts/train_minerva_sft.sh`.
+- The shared SFT implementation lives under `rlvr/cti-scripts/_shared/`.
+- The `dart/` wrappers remain as compatibility aliases, but `rlvr/cti-scripts/` is the canonical entrypoint location on this branch.
 
 10-step smoke-test example:
 
 ```bash
-source .venv/bin/activate
+source .venv-qwen35/bin/activate
 WANDB_MODE=offline \
 SFT_TOTAL_STEPS=10 \
 SFT_TOTAL_EPOCHS=1 \
@@ -199,7 +204,7 @@ SFT_N_GPUS_PER_NODE=4 \
 SFT_RESUME_MODE=disable \
 SFT_TRAIN_BATCH_SIZE=64 \
 SFT_MICRO_BATCH_SIZE_PER_GPU=4 \
-bash dart/train_dart_sft_llama3b.sh
+bash rlvr/cti-scripts/train_minerva_sft_qwen35_4b.sh
 ```
 
 ## Creating Minerva Training Data
@@ -225,7 +230,7 @@ rsync -a /home/jovyan/work/minerva/dataset/{nvd,mitre,capec,cwe,mappings-explore
 Then run:
 
 ```bash
-source .venv/bin/activate
+source .venv-qwen35/bin/activate
 
 # Optional for faster NVD access
 export NVD_API_KEY=...

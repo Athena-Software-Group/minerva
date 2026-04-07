@@ -6,10 +6,11 @@ This document describes the current TARBA implementation and configuration used 
 - Multi-turn RL training with an optional CTI retrieval tool.
 - Per-task controller anneals retrieval availability over training.
 - Retrieval reward shaping uses a linear decay with a floor.
-- Training entrypoint: `rlvr/cti-scripts/train_minerva_tarba_llama3b.sh`.
-- Qwen3 4B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_qwen4b.sh`.
-- Llama 8B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_llama8b.sh`.
-- Qwen3 8B entrypoint: `rlvr/cti-scripts/train_minerva_tarba_qwen8b.sh`.
+- TARBA launchers are archived on the `qwen3.5` branch under `rlvr/old-cti-scripts/qwen35-archive/`.
+- Training entrypoint: `rlvr/old-cti-scripts/qwen35-archive/train_minerva_tarba_llama3b.sh`.
+- Qwen3 4B entrypoint: `rlvr/old-cti-scripts/qwen35-archive/train_minerva_tarba_qwen4b.sh`.
+- Llama 8B entrypoint: `rlvr/old-cti-scripts/qwen35-archive/train_minerva_tarba_llama8b.sh`.
+- Qwen3 8B entrypoint: `rlvr/old-cti-scripts/qwen35-archive/train_minerva_tarba_qwen8b.sh`.
 
 ## High-level flow
 1) TARBA wraps each CTI sample with optional tool instructions that let the model request retrieval once using a short JSON query (hidden tool schema mode).
@@ -65,7 +66,7 @@ Per task key (`data_source`), TARBA maintains:
 - `p_noret`: probability retrieval is disabled
 - EMA accuracy for retrieval-on/off paths
 
-Current training config (from `train_minerva_tarba_llama3b.sh`):
+Current training config (from archived `train_minerva_tarba_llama3b.sh`):
 - `p_noret_init=0.10`
 - `p_noret_max=0.90`
 - `p_step=0.05`

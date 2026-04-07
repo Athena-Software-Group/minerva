@@ -12,11 +12,14 @@
   - dataset builder, task builders, prompts, reward helpers
   - main entrypoints: `minerva/pipeline.py`, `minerva/split.py`
 - `rlvr/cti-scripts/`
-  - primary training launchers for plain GRPO, Noctua, ACRD variants, TARBA, and shared SFT
+  - exactly 6 supported top-level Qwen3.5 launchers:
+    plain GRPO (2), Minerva-Noctua (2), and DART SFT (2)
+  - shared shell helpers live under `rlvr/cti-scripts/_shared/`
+  - archived or experimental launchers live under `rlvr/old-cti-scripts/qwen35-archive/`
 - `rlvr/verl/`
   - trainer, worker, reward, checkpoint, and dataset plumbing used by the launchers
 - `dart/`
-  - model-specific DART SFT wrappers that call `rlvr/cti-scripts/train_minerva_sft.sh`
+  - compatibility wrappers for the canonical Qwen3.5 SFT launchers in `rlvr/cti-scripts/`
 - `dataset/`
   - checked-in runtime assets only
   - currently kept: `dataset/minerva_base_split/`, `dataset/label_details/`, `dataset/models/`
@@ -25,16 +28,16 @@
   - currently kept: `rlvr/mydata/minerva_base/`, `rlvr/mydata/athena/`, `rlvr/mydata/sft/`, `rlvr/mydata/data_prepare/`
 
 ## Setup and environment
-- Default setup entrypoint: `bash scripts/setup_repo.sh`
+- Default setup entrypoint: `bash scripts/setup_qwen35_repo.sh`
 - Lower-level env-only setup: `bash scripts/setup_rlvr_env.sh`
 - Python dependency anchor: `requirements-rlvr-minerva.txt`
 - The repo bootstrap script:
-  - creates or recreates `.venv`
+  - creates or recreates `.venv-qwen35`
   - installs the RLVR-based environment
   - installs `flash-attn`
   - runs `git lfs install`
   - pulls tracked runtime data under `dataset/` and `rlvr/mydata/`
-- Activate with `source .venv/bin/activate`
+- Activate with `source .venv-qwen35/bin/activate`
 
 ## Key code entry points
 - Dataset build orchestration: `minerva/pipeline.py`
@@ -72,22 +75,22 @@
 
 ## Supported training paths
 - Minerva-Noctua:
-  - shared launcher: `rlvr/cti-scripts/train_minerva_noctua.sh`
-  - common wrappers: `train_minerva_noctua_llama3b.sh`, `train_minerva_noctua_qwen4b.sh`, `train_minerva_noctua_qwen8b.sh`
+  - model launchers:
+    `train_minerva_noctua_qwen35_4b.sh`, `train_minerva_noctua_qwen35_9b.sh`
+  - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_noctua.sh`
   - uses GRPO, ACR/ACRD, label details, and the local TextCNN model
   - rollout backend is `vllm`
 - Plain GRPO:
-  - `rlvr/cti-scripts/train_minerva_base_llama3b.sh`
-  - `rlvr/cti-scripts/train_minerva_base_llama8b.sh`
-  - `rlvr/cti-scripts/train_minerva_base_qwen4b.sh`
-  - `rlvr/cti-scripts/train_minerva_base_qwen8b.sh`
+  - `rlvr/cti-scripts/train_minerva_base_qwen35_4b.sh`
+  - `rlvr/cti-scripts/train_minerva_base_qwen35_9b.sh`
   - uses `algorithm.adv_estimator=grpo` and `reward_minerva.py`
   - rollout backend is `vllm`
 - DART SFT:
-  - shared launcher: `rlvr/cti-scripts/train_minerva_sft.sh`
-  - model wrappers under `dart/`
+  - model launchers:
+    `train_minerva_sft_qwen35_4b.sh`, `train_minerva_sft_qwen35_9b.sh`
+  - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_sft.sh`
   - fixed train/validation data comes from `rlvr/mydata/sft/`
-- Secondary or legacy paths still exist in the tree, but the repo-level supported flows are Noctua, plain GRPO, and DART SFT.
+- Secondary or legacy ACRD/TARBA and non-Qwen3.5 paths are archived under `rlvr/old-cti-scripts/qwen35-archive/`.
 
 ## Rebuilding Minerva training data
 - This repo no longer keeps the full raw dataset caches by default.
