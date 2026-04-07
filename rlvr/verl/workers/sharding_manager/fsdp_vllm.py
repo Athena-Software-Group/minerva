@@ -95,16 +95,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         # Full params
         self.full_params = full_params
-        if full_params and fsdp_version(self.module) == 1:
-            FSDP.set_state_dict_type(
-                self.module, state_dict_type=StateDictType.FULL_STATE_DICT, state_dict_config=FullStateDictConfig()
-            )
-        elif fsdp_version(self.module) == 1:
-            FSDP.set_state_dict_type(
-                self.module,
-                state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                state_dict_config=ShardedStateDictConfig(),
-            )
+        self._configure_state_dict_type(self.module)
 
         self.tp_size = self.device_mesh["infer_tp"].size()
         self.tp_rank = self.device_mesh["infer_tp"].get_local_rank()
@@ -123,6 +114,75 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.base_sync_done: bool = "dummy" not in load_format
         if is_version_ge(pkg="vllm", minver="0.7.3"):
             VLLMHijack.hijack()
+
+    def _configure_state_dict_type(self, module: FSDP) -> None:
+        if fsdp_version(module) != 1:
+            return
+        if self.full_params:
+            FSDP.set_state_dict_type(
+                module,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        else:
+            FSDP.set_state_dict_type(
+                module,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+
+    def _normalize_weight_names_for_vllm(self, updated_params: OrderedDict) -> OrderedDict:
+        model = self.model_runner.model
+        root_children = set(dict(model.named_children()).keys())
+        root_params = {name for name, _ in model.named_parameters(recurse=False)}
+        inner_model = getattr(model, "model", None)
+        language_model = getattr(model, "language_model", None)
+        language_children = set()
+        language_params = set()
+        language_inner_model = None
+        language_inner_children = set()
+        language_inner_params = set()
+        if language_model is not None:
+            language_children = set(dict(language_model.named_children()).keys())
+            language_params = {name for name, _ in language_model.named_parameters(recurse=False)}
+            language_inner_model = getattr(language_model, "model", None)
+            if language_inner_model is not None:
+                language_inner_children = set(dict(language_inner_model.named_children()).keys())
+                language_inner_params = {
+                    name for name, _ in language_inner_model.named_parameters(recurse=False)
+                }
+        inner_children = set()
+        inner_params = set()
+        if inner_model is not None:
+            inner_children = set(dict(inner_model.named_children()).keys())
+            inner_params = {name for name, _ in inner_model.named_parameters(recurse=False)}
+        normalized_params = type(updated_params)()
+        renamed_count = 0
+        for name, value in updated_params.items():
+            if name.startswith("language_model."):
+                normalized_params[name] = value
+                continue
+            first_segment = name.split(".", 1)[0]
+            if first_segment in root_children or first_segment in root_params:
+                normalized_params[name] = value
+                continue
+            if first_segment in language_children or first_segment in language_params:
+                normalized_params[f"language_model.{name}"] = value
+                renamed_count += 1
+                continue
+            if first_segment in language_inner_children or first_segment in language_inner_params:
+                normalized_params[f"language_model.model.{name}"] = value
+                renamed_count += 1
+                continue
+            if first_segment in inner_children or first_segment in inner_params:
+                normalized_params[f"model.{name}"] = value
+                renamed_count += 1
+                continue
+            normalized_params[name] = value
+
+        if renamed_count:
+            logger.info("Normalized %s rollout weight names for the vLLM model structure.", renamed_count)
+        return normalized_params
 
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
@@ -195,6 +255,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             get_torch_device().empty_cache()
 
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+            self._configure_state_dict_type(self.module)
             if self.offload_param:
                 load_fsdp_model_to_gpu(self.module)
 
@@ -342,6 +403,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
         patch_vllm_moe_model_weight_loader(model)
+        updated_params = self._normalize_weight_names_for_vllm(updated_params)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
         loaded_params = model.load_weights(
             (

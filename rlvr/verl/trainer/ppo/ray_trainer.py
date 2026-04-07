@@ -1581,8 +1581,7 @@ class RayPPOTrainer:
         if not acr_cfg.get("per_batch", False):
             return
         if self.processor is not None:
-            print("ACR per-batch disabled: multimodal processor is not supported.")
-            return
+            print("ACR per-batch: using tokenizer-only prompt construction with a multimodal processor attached.")
 
         try:
             from minerva.acr_prompt import dedupe_labels, extract_gold_labels, try_build_acr_messages

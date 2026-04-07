@@ -70,6 +70,7 @@ class HFModelConfig(BaseConfig):
     enable_activation_offload: bool = False
 
     use_remove_padding: bool = False
+    force_causal_lm: bool = False
 
     # lora related. We may setup a separate config later
     lora_rank: int = 0
@@ -113,6 +114,8 @@ class HFModelConfig(BaseConfig):
         self.hf_config = AutoConfig.from_pretrained(
             self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation
         )
+        if self.force_causal_lm:
+            self.hf_config.force_causal_lm = True
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,

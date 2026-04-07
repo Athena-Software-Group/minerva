@@ -47,11 +47,22 @@ from filelock import FileLock
 from omegaconf import DictConfig, ListConfig
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel
+from vllm.config import CompilationConfig
+try:
+    from vllm.config import CompilationLevel
+except ImportError:
+    CompilationLevel = None
+    from vllm.config import CUDAGraphMode
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    from vllm.model_executor.sampling_metadata import SamplingMetadata
+except ImportError:
+    from vllm.v1.sample.metadata import SamplingMetadata
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ImportError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
@@ -171,9 +182,12 @@ class vLLMRollout(BaseRollout):
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
             if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
-                )
+                kwargs = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                if CompilationLevel is not None:
+                    kwargs["level"] = CompilationLevel.PIECEWISE
+                else:
+                    kwargs["cudagraph_mode"] = CUDAGraphMode.PIECEWISE
+                compilation_config["compilation_config"] = CompilationConfig(**kwargs)
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
@@ -193,7 +207,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=config.get("enable_prefix_caching", True),
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **compilation_config,

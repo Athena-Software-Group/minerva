@@ -24,7 +24,12 @@ from omegaconf import DictConfig, ListConfig
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from vllm import SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel
+from vllm.config import CompilationConfig
+try:
+    from vllm.config import CompilationLevel
+except ImportError:
+    CompilationLevel = None
+    from vllm.config import CUDAGraphMode
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
@@ -34,7 +39,10 @@ from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ImportError:
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils import hf_processor
@@ -252,9 +260,12 @@ class AsyncvLLMServer(AsyncServerBase):
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
             if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
-                )
+                kwargs = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                if CompilationLevel is not None:
+                    kwargs["level"] = CompilationLevel.PIECEWISE
+                else:
+                    kwargs["cudagraph_mode"] = CUDAGraphMode.PIECEWISE
+                compilation_config["compilation_config"] = CompilationConfig(**kwargs)
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 

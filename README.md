@@ -57,6 +57,17 @@ PULL_LFS=0 bash scripts/setup_repo.sh
 
 The lower-level env-only script still exists at `scripts/setup_rlvr_env.sh`, but `scripts/setup_repo.sh` is the default entrypoint for this repo.
 
+### Qwen3.5 Setup
+
+`Qwen/Qwen3.5-4B` needs the newer `vllm` and `transformers` stack already wired into this branch. The cleanest path is to keep it in its own venv:
+
+```bash
+bash scripts/setup_qwen35_repo.sh
+source .venv-qwen35/bin/activate
+```
+
+This wrapper uses the same repo bootstrap flow as `scripts/setup_repo.sh`, but defaults to `.venv-qwen35` so the Qwen3.5 environment stays isolated from the main `.venv`.
+
 ## Checked-In Runtime Data
 
 The repo already includes the runtime datasets used by the training scripts:
@@ -86,6 +97,7 @@ The repo already includes the runtime datasets used by the training scripts:
 Main launchers:
 
 - `rlvr/cti-scripts/train_minerva_noctua_llama3b.sh`
+- `rlvr/cti-scripts/train_minerva_noctua_qwen35_4b.sh`
 - `rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh`
 - `rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh`
 
@@ -101,6 +113,7 @@ Notes:
 - Noctua uses the checked-in Minerva RL train parquet, Athena validation parquets, `dataset/label_details/`, and the checked-in TextCNN filter model.
 - The Noctua path defaults to `4` GPUs in this repo.
 - The core launcher is `rlvr/cti-scripts/train_minerva_noctua.sh`.
+- The verified Qwen3.5 path uses `vllm` and defaults EMA-teacher distillation off in `train_minerva_noctua_qwen35_4b.sh`. The 10-step smoke test on this branch used that default and saved a checkpoint successfully.
 
 10-step smoke-test example:
 
@@ -120,6 +133,7 @@ Main launchers:
 
 - `rlvr/cti-scripts/train_minerva_base_llama3b.sh`
 - `rlvr/cti-scripts/train_minerva_base_llama8b.sh`
+- `rlvr/cti-scripts/train_minerva_base_qwen35_4b.sh`
 - `rlvr/cti-scripts/train_minerva_base_qwen4b.sh`
 - `rlvr/cti-scripts/train_minerva_base_qwen8b.sh`
 
@@ -155,6 +169,7 @@ Main launchers:
 
 - `dart/train_dart_sft_llama3b.sh`
 - `dart/train_dart_sft_llama8b.sh`
+- `dart/train_dart_sft_qwen35_4b.sh`
 - `dart/train_dart_sft_qwen4b.sh`
 - `dart/train_dart_sft_qwen8b.sh`
 

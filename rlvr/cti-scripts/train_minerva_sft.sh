@@ -53,6 +53,7 @@ SAVE_FREQ="${SFT_SAVE_FREQ:-10}"
 TEST_FREQ="${SFT_TEST_FREQ:-10}"
 N_GPUS="${SFT_N_GPUS_PER_NODE:-4}"
 RESUME_MODE="${SFT_RESUME_MODE:-auto}"
+FORCE_CAUSAL_LM="${SFT_FORCE_CAUSAL_LM:-false}"
 
 EXTRA_TRAINER_ARGS=()
 EXTRA_TRAINER_ARGS+=(trainer.total_epochs="$TOTAL_EPOCHS")
@@ -72,6 +73,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$N_GPUS" \
   data.multiturn.enable=true \
   data.multiturn.messages_key=messages \
   model.partial_pretrain="$MODEL_PATH" \
+  +model.force_causal_lm="$FORCE_CAUSAL_LM" \
   trainer.default_local_dir="$OUTPUT_ROOT" \
   trainer.project_name='dart' \
   trainer.experiment_name="$EXPERIMENT_NAME" \

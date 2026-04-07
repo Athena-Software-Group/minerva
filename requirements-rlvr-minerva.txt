@@ -1,6 +1,8 @@
 -r rlvr/requirements.txt
-transformers==4.54.1
 requests>=2.31.0
 pyyaml>=6.0
 tqdm>=4.66.0
 cvss>=3.2
+pillow>=10.0.0
+torchvision
+qwen-vl-utils>=0.0.14

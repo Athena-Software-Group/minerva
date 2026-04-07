@@ -10,9 +10,10 @@ import re
 from typing import Any, Iterable, List, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from verl.utils.reward_score.reward_acr import reward_acr
+from verl.utils.model import get_hf_auto_model_class
 
 
 _RUBRIC_KEYS = (
@@ -116,7 +117,9 @@ def _ensure_judge(
     if torch_dtype is not None:
         model_kwargs["torch_dtype"] = torch_dtype
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    model_cls = get_hf_auto_model_class(model_config)
+    model = model_cls.from_pretrained(model_name, config=model_config, **model_kwargs)
     if not device_map or device_map == "none":
         if device is None or device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"

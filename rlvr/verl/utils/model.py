@@ -114,7 +114,8 @@ def create_huggingface_actor(model_name: str, override_config_kwargs=None, autom
     module_config = get_huggingface_actor_config(
         model_name, override_config_kwargs, trust_remote_code=automodel_kwargs.get("trust_remote_code", False)
     )
-    module: nn.Module = AutoModelForCausalLM.from_config(module_config, **automodel_kwargs)
+    model_cls = get_hf_auto_model_class(module_config)
+    module: nn.Module = model_cls.from_config(module_config, **automodel_kwargs)
     return module
 
 
@@ -663,12 +664,14 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
     return model
 
 
-def get_hf_auto_model_class(hf_config):
+def get_hf_auto_model_class(hf_config, prefer_causal_lm: bool = False):
     from transformers import AutoModel, AutoModelForCausalLM
     try:
         from transformers import AutoModelForVision2Seq
     except ImportError:
         from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+
+    prefer_causal_lm = prefer_causal_lm or bool(getattr(hf_config, "force_causal_lm", False))
 
     has_remote_code = hasattr(hf_config, "auto_map") and any(
         hf_config.architectures[0] in val for val in hf_config.auto_map.values()
@@ -683,7 +686,9 @@ def get_hf_auto_model_class(hf_config):
             case _:
                 actor_module_class = AutoModel
     else:
-        if type(hf_config) in AutoModelForVision2Seq._model_mapping.keys():
+        if prefer_causal_lm and type(hf_config) in AutoModelForCausalLM._model_mapping.keys():
+            actor_module_class = AutoModelForCausalLM
+        elif type(hf_config) in AutoModelForVision2Seq._model_mapping.keys():
             actor_module_class = AutoModelForVision2Seq
         elif type(hf_config) in AutoModelForCausalLM._model_mapping.keys():
             actor_module_class = AutoModelForCausalLM

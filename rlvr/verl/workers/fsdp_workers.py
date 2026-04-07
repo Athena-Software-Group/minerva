@@ -272,7 +272,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         except ImportError:
             from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
-        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import (
+            get_generation_config,
+            get_hf_auto_model_class,
+            print_model_size,
+            update_model_config,
+        )
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -314,15 +319,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
+        explicit_force_causal_lm = bool(self.config.model.get("force_causal_lm", False))
+
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "pad_token_id": self.tokenizer.pad_token_id,
         }
+        if explicit_force_causal_lm:
+            override_config_kwargs["force_causal_lm"] = True
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
+
+        prefer_causal_lm = bool(
+            actor_model_config.model_type == "qwen3_5"
+            and self.config.rollout.get("engine_kwargs", {}).get("vllm", {}).get("language_model_only", False)
+        ) or explicit_force_causal_lm or bool(getattr(actor_model_config, "force_causal_lm", False))
+        if prefer_causal_lm:
+            actor_model_config.force_causal_lm = True
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(
@@ -331,27 +347,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+            actor_module_class = get_hf_auto_model_class(
+                actor_model_config,
+                prefer_causal_lm=prefer_causal_lm,
             )
-            if has_remote_code:
-                auto_class = next(
-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
-                )
-                match auto_class:
-                    case "AutoModelForVision2Seq":
-                        actor_module_class = AutoModelForVision2Seq
-                    case "AutoModelForCausalLM":
-                        actor_module_class = AutoModelForCausalLM
-                    case _:
-                        actor_module_class = AutoModel
-            else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                    actor_module_class = AutoModelForVision2Seq
-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
-                    actor_module_class = AutoModelForCausalLM
-                else:
-                    actor_module_class = AutoModel
 
             actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
