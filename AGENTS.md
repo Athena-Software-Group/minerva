@@ -3,9 +3,9 @@
 ## Project summary
 - This repo has three active paths:
   - `minerva/`: CTI dataset construction and reward helpers
-  - `rlvr/`: VeRL/RLVR training for plain GRPO and Minerva-Noctua
+  - `rlvr/`: VeRL/RLVR training for plain GRPO and MinervaRL
   - `dart/`: fixed-dataset SFT launchers for the checked-in DART data
-- The root [README.md](/home/jovyan/work/athena/minerva/README.md) is the central runbook. Prefer it over older scattered docs.
+- The root [README.md](README.md) is the central runbook. Prefer it over older scattered docs.
 
 ## Current repo layout
 - `minerva/`
@@ -13,7 +13,7 @@
   - main entrypoints: `minerva/pipeline.py`, `minerva/split.py`
 - `rlvr/cti-scripts/`
   - exactly 12 supported top-level launchers:
-    plain GRPO (4), Minerva-Noctua (4), and DART SFT (4)
+    plain GRPO (4), MinervaRL (4), and DART SFT (4)
   - shared shell helpers live under `rlvr/cti-scripts/_shared/`
   - archived or experimental launchers live under `rlvr/old-cti-scripts/`
 - `rlvr/verl/`
@@ -45,7 +45,7 @@
 - CTI reward helpers: `minerva/reward.py`
 - VeRL parquet conversion: `rlvr/mydata/data_prepare/cti.py`
 - RL trainer controller: `rlvr/verl/trainer/ppo/ray_trainer.py`
-- Noctua and CTI reward logic:
+- MinervaRL and CTI reward logic:
   - `rlvr/verl/utils/reward_score/reward_minerva.py`
   - `rlvr/verl/utils/reward_score/reward_acr.py`
   - `rlvr/verl/utils/reward_score/reward_acr_batch.py`
@@ -64,7 +64,7 @@
   - `rlvr/mydata/athena/athena_cti_rms.parquet`
   - `rlvr/mydata/athena/athena_cti_taa.parquet`
   - `rlvr/mydata/athena/athena_cti_vsp.parquet`
-- Noctua extras:
+- MinervaRL extras:
   - `dataset/label_details/`
   - `dataset/models/textcnn-response-only-lr6e-4-k345-f384-e300-t1024-d0p25/`
 - DART SFT data:
@@ -74,12 +74,12 @@
 - These runtime artifacts are intended to live in Git LFS. Treat them as generated data, not hand-edited source files.
 
 ## Supported training paths
-- Minerva-Noctua:
+- MinervaRL:
   - model launchers:
     `train_minerva_noctua_llama3b.sh`, `train_minerva_noctua_llama8b.sh`,
     `train_minerva_noctua_qwen4b.sh`, `train_minerva_noctua_qwen8b.sh`
   - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_noctua.sh`
-  - uses GRPO, ACR/ACRD, label details, and the local TextCNN model
+  - uses GRPO, deferred ACR generation with an EMA teacher, heuristic + TextCNN filtering, and original-prompt SFT distillation
   - rollout backend is `vllm`
 - Plain GRPO:
   - `rlvr/cti-scripts/train_minerva_base_llama3b.sh`
@@ -94,7 +94,9 @@
     `train_minerva_sft_qwen4b.sh`, `train_minerva_sft_qwen8b.sh`
   - shared implementation: `rlvr/cti-scripts/_shared/train_minerva_sft.sh`
   - fixed train/validation data comes from `rlvr/mydata/sft/`
-- Secondary or legacy ACRD/TARBA paths are archived under `rlvr/old-cti-scripts/`.
+- Legacy ACRD/LHC experiments and paper ablation launchers remain under `rlvr/old-cti-scripts/`. Standalone TARBA retrieval experiments have been removed.
+- Preserve shared label helpers in `minerva/label_specs.py` and corpus builders in `minerva/analysis/retrieval_candidates.py`; the active MinervaRL path uses them.
+- The `noctua` launcher filenames and `ACRD_*` environment variables are compatibility names for MinervaRL.
 
 ## Rebuilding Minerva training data
 - This repo no longer keeps the full raw dataset caches by default.
@@ -109,7 +111,7 @@
 - Common rebuild flow:
   - `python -m minerva.pipeline --config minerva/config.yaml --variant base --output-root dataset/minerva_base`
   - `python -m minerva.split --input-dir dataset/minerva_base --output-dir dataset/minerva_base_split --file-prefix minerva-base`
-  - `python scripts/build_label_details.py`
+  - `python -m scripts.build_label_details`
   - `python rlvr/mydata/data_prepare/cti.py --data_dir dataset/minerva_base_split --out_dir rlvr/mydata/minerva_base`
 - To regenerate Athena validation parquet files, place the Athena JSONLs alongside the Minerva split inputs before rerunning `cti.py`.
 
@@ -122,7 +124,7 @@
 
 ## Repo hygiene and gotchas
 - Avoid hand-editing checked-in dataset files unless explicitly requested.
-- `rlvr/` is large; do not assume the whole tree was synced from the source repo. The current curated path is the minimal set needed for Noctua, plain GRPO, and DART SFT.
+- `rlvr/` is large; do not assume the whole tree was synced from the source repo. The current curated path is the minimal set needed for MinervaRL, plain GRPO, and DART SFT.
 - External CTI fetches can be slow and rate-limited. Prefer existing local caches when available.
 - Be careful not to reintroduce removed runtime datasets such as old `seceval` validation files unless the user asks for them.
 

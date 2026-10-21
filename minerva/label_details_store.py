@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from minerva.retrieval.task_specs import normalize_label
+from minerva.label_specs import normalize_label
 
 
 DEFAULT_DETAILS_DIR = Path(__file__).resolve().parents[1] / "dataset" / "label_details"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Minerva-Noctua launcher for Qwen3 4B (distill lr_scale=0.05, flush buffer, batch size 256,
+# MinervaRL launcher (legacy noctua filename) for Qwen3 4B (distill lr_scale=0.05, flush buffer, batch size 256,
 # TextCNN ML+heuristic filter, deferred ACR generation, EMA teacher alpha 0.995,
 # ACR rollout temperature 0.7, top_p 0.9).
 

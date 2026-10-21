@@ -16,7 +16,7 @@ from minerva.acr_prompt import build_acr_block
 from minerva.acr_trace_buffer import AcrTraceBuffer, is_accepted
 from minerva.cti_task_specs import get_task_spec
 from minerva.label_details_store import LabelDetailsStore
-from minerva.retrieval.task_specs import normalize_label
+from minerva.label_specs import normalize_label
 from rlvr.verl.utils.reward_score.reward_acr import reward_acr
 
 

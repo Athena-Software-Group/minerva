@@ -1,368 +1,77 @@
-# ACRD: Answer-Conditioned Reasoning + Distillation (Per-Batch)
+# MinervaRL: method and implementation
 
-This spec replaces LHC-style candidate hints and TARBA retrieval with a per-batch loop:
-1) regular RLVR on the original prompt,
-2) answer-conditioned reasoning RL on the same batch (lower weight),
-3) SFT distillation on the ACR traces every iteration.
+MinervaRL is the training method in [the Minerva paper](https://openreview.net/forum?id=w1IMu9exKC). Noctua / Minerva-Noctua are historical names for the same method. The `train_minerva_noctua_*.sh` filenames and `ACRD_*` environment variables remain stable so existing commands continue to work. This guide describes the supported MinervaRL launchers on `main`.
 
-ACRD uses the same RLVR trainer, with a per-batch ACR + distill phase inserted into
-`rlvr/verl/trainer/ppo/ray_trainer.py`.
+## Training loop
 
----
+1. **GRPO on original prompts.** Sample eight completions per prompt and score them with the task verifier.
+2. **Buffer hard prompts.** A prompt is hard when its best rollout reward is below 1.0. CVSS prompts are excluded from this auxiliary step.
+3. **Deferred answer-conditioned rationale (ACR) generation.** Every 10 steps, build prompts with the ground-truth label and canonical label details. The EMA teacher generates four traces per prompt, at temperature 0.7 and top-p 0.9.
+4. **Verify and filter.** Require verifier success, apply leakage/degeneracy heuristics, and use the response-only TextCNN quality filter with threshold 0.5. Keep at most one accepted trace per original prompt.
+5. **Distill onto original prompts.** Apply an SFT update using up to 256 accepted traces and a learning-rate scale of 0.05, then flush the buffers. The SFT inputs use `acr_orig_prompt` / `orig_prompt`, without the gold-label context used for generation.
 
-## High-level algorithm
+The supported launcher sets `data.acr.update_actor=false`: the auxiliary ACR phase produces traces for SFT; it does not perform a second GRPO update on answer-conditioned prompts. Gold labels and canonical references are training-time inputs for the teacher. Inference uses the original prompt.
 
-Let training samples be (x, y*) with `data_source` identifying the task.
+## Paper-to-code map
 
-### Step 1: RLVR (baseline)
-Run your existing RLVR training loop on the standard prompts (no ground truth revealed).
+| Paper component | Implementation |
+| --- | --- |
+| GRPO and auxiliary-phase orchestration | [`RayPPOTrainer`](../rlvr/verl/trainer/ppo/ray_trainer.py), including `_compute_acr_hard_uids`, `_build_acr_batch`, `_run_acr_phase`, `_collect_distill_candidates`, and `_maybe_run_distill_sft` |
+| ACR prompt construction | [`acr_prompt.py`](../minerva/acr_prompt.py) |
+| Task metadata and label normalization | [`cti_task_specs.py`](../minerva/cti_task_specs.py) and [`label_specs.py`](../minerva/label_specs.py) |
+| Canonical label details | [`label_details_store.py`](../minerva/label_details_store.py) and [`build_label_details.py`](../scripts/build_label_details.py) |
+| Task verifiers | [`reward_minerva.py`](../rlvr/verl/utils/reward_score/reward_minerva.py), using the task helpers in [`minerva/reward.py`](../minerva/reward.py) |
+| ACR correctness and leakage checks | [`reward_acr.py`](../rlvr/verl/utils/reward_score/reward_acr.py) |
+| TextCNN loading and scoring | `_maybe_init_acr_filter_model` and `_acr_filter_score_textcnn` in [`ray_trainer.py`](../rlvr/verl/trainer/ppo/ray_trainer.py) |
+| Shared training configuration | [`train_minerva_noctua.sh`](../rlvr/cti-scripts/_shared/train_minerva_noctua.sh) |
 
-### Step 2: ACR-RL (answer-conditioned reasoning RL)
-Per-batch ACR is built inside `rlvr/verl/trainer/ppo/ray_trainer.py` from the same
-training batch used in Step 1. It appends an ACR block to the last user message of
-`raw_prompt` (so `data.return_raw_chat=true` is required).
+Canonical label references are looked up by the known training label. MinervaRL does not require a retrieval server or a retrieval tool call. The old standalone TARBA service, dataset/reward wrappers, tool configuration, and launchers have been removed. Shared corpus builders in `minerva/analysis/retrieval_candidates.py` remain because label-detail construction and legacy LHC dataset generation use them.
 
-The ACR block is produced by `minerva/acr_prompt.build_acr_block(...)` and includes:
-- GROUND_TRUTH_LABELS (one per line)
-- CANONICAL_LABEL_DETAILS (from `LabelDetailsStore`, joined with `\n\n---\n\n` for multi-label)
-- Instructions to produce reasoning + final answer in the original task format
-- Optional "Do not include the exact label(s) in the reasoning section" when
-  `data.acr.enforce_no_id_in_reasoning=true`
+## Supported launchers and settings
 
-Prompt-length handling (`try_build_acr_messages`):
-- First try full details (up to `data.acr.max_details_chars`).
-- If still too long, omit details entirely.
-- If still too long, skip ACR for that sample.
-If `entity_type` is not resolved (e.g., CVSS tasks), the canonical details section is omitted.
-For MCQ tasks with option letters, the ACR builder maps the gold option letter to the
-option text and uses that text (or its extracted ID) to fetch label details.
+Run setup from the [root README](../README.md#first-setup), then select a model:
 
-ACR rollouts use the same actor as RLVR but a separate repeat count:
-`data.acr.rollout_n` (default 4).
+| Backbone | Launcher |
+| --- | --- |
+| Llama-3.2-3B-Instruct | [`train_minerva_noctua_llama3b.sh`](../rlvr/cti-scripts/train_minerva_noctua_llama3b.sh) |
+| Llama-3.1-8B-Instruct | [`train_minerva_noctua_llama8b.sh`](../rlvr/cti-scripts/train_minerva_noctua_llama8b.sh) |
+| Qwen3-4B-Base | [`train_minerva_noctua_qwen4b.sh`](../rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh) |
+| Qwen3-8B-Base | [`train_minerva_noctua_qwen8b.sh`](../rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh) |
 
-Reward (`reward_acr`) uses the RLVR parsing logic (`reward_minerva`) and returns:
-- `acr_base_score` = `reward_minerva` score (0..1), before scaling
-- `score` = `r_correct * acr_base_score - leak_penalty` (no ID leak penalty)
-- `acr_leak_hit` from banned phrase detection (fuzzy by default)
-- `acr_id_leak_hit` if the reasoning section contains any gold IDs (logged only)
+The model launchers set the MinervaRL configuration below before calling the shared script. The corresponding paper settings are in Appendix K.1-K.2.
 
-### Step 3: Distillation SFT
-Per-batch distillation is handled by the PPO trainer and uses the same batch.
-Selection is per-UID (one record per original prompt):
+| Setting | MinervaRL launcher value |
+| --- | --- |
+| Training steps / prompts per step | 500 / 128 |
+| GRPO rollouts per prompt / actor learning rate | 8 / `1e-6` |
+| Original prompt / ACR prompt / response limits | 2048 / 4096 / 1024 tokens |
+| Hard-prompt rule | Maximum rollout reward `< 1.0`; skip CVSS |
+| ACR interval / rollouts / temperature / top-p | 10 steps / 4 / 0.7 / 0.9 |
+| EMA teacher decay | 0.995 |
+| Trace filter | `ml+heuristic`, TextCNN threshold 0.5 |
+| Distillation | SFT, at most 256 traces, learning-rate scale 0.05, flush buffer |
+| GPUs | 4 by default; override with `ACRD_N_GPUS_PER_NODE` |
 
-- Eligibility: `acr_base_score >= data.acr.distill.reward_threshold`
-  (threshold is applied before r_correct scaling).
-- Among eligible rollouts, pick the response with the highest weighted ACR reward
-  (`score` includes leak penalty). Tie-breaker is mean NLL (`entropy_tiebreak=mean_nll`).
-
-Accepted records are stored as:
-- `prompt_nohint`: `extra_info["acr_prompt"]` (the modified prompt with answer hints)
-- `response_ids`: selected response token IDs
-- `reward`: weighted ACR score
-- `entropy_proxy`: mean NLL of the selected response
-
-SFT runs every `data.acr.distill.interval` steps (default 1).
-
----
-
-## Implementation map
-
-### 0) Task specs (data_source -> entity type)
-Implemented in `minerva/cti_task_specs.py`:
-
-```python
-TASK_SPECS[data_source] = {
-  "entity_type": "attack_technique_id" | "cwe_id" | "threat_actor_name" | None,
-  "is_multilabel": bool,
-  "label_id_regex": str | None,  # optional for ID leak checks
-}
-```
-
-Rules:
-- Prefer `extra_info["source_file"]` (JSONL stem) or `extra_info["task"]` to resolve the task key.
-- If a task key maps to `minerva.analysis.retrieval_candidates.TASK_SPECS`, use that.
-- Fall back to `minerva.retrieval.task_specs.get_task_spec(data_source, ground_truth)`.
-- If nothing resolves, infer `is_multilabel` from ground_truth type (list/tuple -> multi).
-
-This avoids ambiguity in `binary_id` tasks by using the JSONL file stem or task name.
-
----
-
-### 1) Canonical label-details store (for Step 2 prompts)
-We need a fast lookup from `(entity_type, label_id)` to a short, canonical details string.
-
-#### 1.1 Build details JSONL
-`scripts/build_label_details.py` generates:
-- `dataset/label_details/<entity_type>.jsonl`
-- `dataset/label_details/_manifest.json`
-- `dataset/label_details/metadata.json` (counts + examples per label type)
-
-Each JSONL record:
-
-```json
-{
-  "key": "attack_technique_id:T1059.003",
-  "entity_type": "attack_technique_id",
-  "canonical_id": "T1059.003",
-  "name": "Windows Command Shell",
-  "aliases": ["cmd.exe", "Command Prompt"],
-  "definition": "...",
-  "metadata": {"tactic": ["Execution"], "parent": "attack_technique_id:T1059"},
-  "details_text": "ID: T1059.003\nName: Windows Command Shell\nAliases: ...\nTactic: Execution\nDefinition: ...\nParent: T1059\n"
-}
-```
-
-Rules:
-- No dataset examples.
-- Store full `details_text` (no build-time cap). Cap at runtime in the ACR dataset if needed.
-- Source MITRE/CAPEC/CWE from cached files in `dataset/`.
-- Prefer the same corpus text used by TARBA label docs so technique/mitigation details include relationships.
-- Preserve newlines in `details_text`; they are passed through into the ACR prompt.
-
-Details formatting (current):
-- `attack_tactic_id`: `ID:` + `Name:` + tactic description, then a blank line and `Techniques:` list (one per line).
-- `attack_technique_id`: name line, optional `Sub-techniques (N)` table (`ID\tName`), blank line, description,
-  blank line, `Mitigations` table (`ID\tMitigation\tDescription`), blank line, `Detection Strategy` table (`ID\tName` only).
-- `mitigation_id`: `ID:` + `Name:` + `Definition:` followed by `Techniques Addressed by Mitigation:` at the end
-  (one `Txxxx - Name` per line).
-- `cwe_id`: `<CWE-####>: <Name>` header, `Description` section, optional `Extended Description`,
-  optional `Background Details` (each section separated by a blank line).
-
-#### 1.2 Runtime loader
-`minerva/label_details_store.py` loads all JSONL files into a dict mapping `key -> details_text`.
-It also builds an alias index (canonical ID, name, and aliases) so values like
-"Pawn Storm" resolve to `APT28`.
-
-```python
-def get_details(entity_type: str, label_ids: list[str]) -> str:
-    # concatenate details blocks with "\n\n---\n\n" between labels
-```
-
----
-
-### 2) ACR dataset (answer-conditioned RL)
-Standalone ACR runs can use `rlvr/verl/utils/dataset/minerva_acr_dataset.py` (`ACRRLHFDataset`).
-Per-batch ACRD does not use this class; it builds the ACR batch directly in the trainer.
-
-Key points:
-- Inherit from `RLHFDataset`.
-- Set `data.dataloader_num_workers=0` in configs.
-- Store the original prompt for SFT in `extra_info["acr_orig_prompt"]` (deep copy).
-- Store ACR metadata:
-  - `extra_info["acr_entity_type"]`
-  - `extra_info["acr_gold_labels"]`
-  - `extra_info["acr_gold_keys"]` (e.g., `entity_type:ID`)
-  - `extra_info["acr_mode"] = "acr"`
-
-#### 2.1 ACR prompt template
-The ACR block is appended to the last user message:
-
-```text
-You are generating a reasoning trace for training.
-
-GROUND_TRUTH_LABELS:
-- <ID1>
-- <ID2>
-
-CANONICAL_LABEL_DETAILS:
-<details_text from store>
-
-Instructions:
-- Write a short reasoning that would justify selecting the correct label(s) from the input.
-- Do NOT say or imply that the answer was provided (no phrases like "given the answer", "based on the provided label", "ground truth", etc.).
-- End with the final answer in the same format required by the original task.
-- Put the final answer on its own line at the end.
-
-Optional (only when `enforce_no_id_in_reasoning=true`):
-- "Do not include the exact label(s) in the reasoning section."
-```
-
-Prompt-length control:
-- If the prompt exceeds `data.acr.max_prompt_length`, truncate `details_text` first.
-- If still too long, keep the GROUND_TRUTH block but omit details.
-- If still too long, skip ACR for that sample.
-
----
-
-### 3) ACR reward (verifiable, no LLM judge)
-Implemented in `rlvr/verl/utils/reward_score/reward_acr.py` (`reward_acr`).
-
-#### 3.1 Parsing and extraction
-- Use the same extraction logic as `reward_minerva` (RLVR) for the task's answer format.
-- Treat the final answer as the last non-empty line (reasoning comes before it).
-
-#### 3.2 Correctness
-- Uses the `reward_minerva` score as `acr_base_score`.
-- `acr_is_correct` is `acr_base_score == 1.0` (full match).
-
-#### 3.3 Leakage phrase penalties
-- Use a small banned-phrase list (case-insensitive substring).
-- Fuzzy check via `difflib.SequenceMatcher` (no heavy deps, enabled by default).
-
-#### 3.4 "ID in reasoning" detection
-- The reasoning section (everything before the last non-empty line) is checked for gold IDs.
-- This is logged as `acr_id_leak_hit` but is not penalized in the score.
-
-#### 3.5 Reward scalar
-Example (current defaults):
-
-```text
-r = 0
-if extracted and acr_base_score > 0:
-  r += r_correct * acr_base_score
-if leak_hit:
-  r -= leak_penalty       # e.g. 0.5
-```
-
-Return a dict with:
-- `score` (float)
-- `acr_base_score`
-- `acr_is_correct`
-- `acr_extracted`
-- `acr_leak_hit`
-- `acr_id_leak_hit`
-
----
-
-### 4) Accepted-trace collection for SFT
-Per-batch ACRD uses the trainer's in-memory distill buffer. Offline collection is optional.
-
-#### 4.1 Buffer
-Per-batch ACRD uses the trainer's in-memory distill buffer (configured under `data.acr.distill.*`).
-The JSONL buffer is only needed for the optional offline pipeline.
-
-Each per-batch record includes:
-- `uid` (original prompt ID)
-- `task_key` (data_source)
-- `prompt_nohint` (historical name; contains the ACR prompt with answer hints)
-- `response_ids` (selected rollout response)
-- `reward` (weighted ACR score)
-- `entropy_proxy` (mean NLL of the selected response)
-
-#### 4.2 Acceptance criteria (per-batch)
-- Eligibility: `acr_base_score >= reward_threshold` (pre-scaling).
-- Selection: max weighted `score` among eligible rollouts, tie-break by mean NLL.
-- Leak hits are not hard-filtered; they are penalized via `leak_penalty`.
-
-#### 4.3 Collection mode
-Option A (preferred): per-batch collection via `data.acr.distill.enabled=true` and
-`data.return_raw_chat=true`.
-
-Option B (offline): collect traces from a checkpoint.
+The shared script also exposes options used by older experiments. Use a model launcher to obtain the settings above, rather than invoking the shared script directly.
 
 ```bash
-python scripts/collect_acr_traces.py \
-  --ckpt <hf_model_path> \
-  --dataset <train_parquet> \
-  --out outputs/acr_sft_buffer.jsonl
+source .venv/bin/activate
+WANDB_MODE=offline \
+ACRD_EXPERIMENT_NAME=smoke_minervarl_llama3b_10steps \
+bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh \
+  trainer.total_training_steps=10 \
+  trainer.save_freq=10 \
+  trainer.test_freq=10
 ```
 
-The offline pipeline is optional and mainly useful for debugging or analysis.
+## Baselines and evaluation
 
----
+The 12 supported launchers cover MinervaRL, plain GRPO, and fixed-dataset DART SFT (DART-CTI), each on four backbones. See the [training commands](../README.md#training). The paper also reports STaR-CTI and LUFFY-CTI; this curated checkout does not provide top-level launchers for those baselines.
 
-### 5) Optional SFT dataset build (offline pipeline)
-Use `scripts/build_sft_from_acr.py` to transform the JSONL buffer into an SFT dataset.
+MinervaRL validates on Minerva-Dev plus the six checked-in AthenaBench-Mini task parquets: ATE, CKT, RCM, RMS, TAA, and VSP. The shared launcher's default best-checkpoint metric is `val-core/global-val/reward/mean`. TAA is excluded from the paper's final 12-task evaluation; of the 950 AthenaBench-Mini examples, 900 are from the five overlapping tasks and 50 are TAA examples.
 
-Output format (recommended for MultiTurnSFTDataset):
-- `messages`: `orig_prompt + [{"role":"assistant","content": target_completion}]`
-Uses `acr_prompt` when available; falls back to `orig_prompt` for older buffers.
+The plain GRPO wrappers currently validate on Minerva-Dev plus ATE, CKT, RCM, and RMS. They also retain older batch-size and response-length defaults. To use the paper's batch/length settings, pass `data.train_batch_size=128 actor_rollout_ref.actor.ppo_mini_batch_size=128 data.max_prompt_length=2048 data.max_response_length=1024 trainer.total_training_steps=500`; configure `data.val_files` explicitly when a matching validation pool is required. These differences are documented here rather than changing existing experiment settings.
 
----
+DART-CTI uses the fixed synthetic training and validation parquets in `rlvr/mydata/sft/`. Its checkpoints are selected by synthetic-validation loss, as described in Appendix K.3.
 
-### 6) Per-batch training script (archived ACRD wrappers)
-On `main`, the supported ACRD path is exposed through the Minerva-Noctua launchers in
-`rlvr/cti-scripts/`. The older `train_minerva_acrd*.sh` wrappers were archived under
-`rlvr/old-cti-scripts/`.
-
-Supported model entrypoints on `main`:
-
-- `rlvr/cti-scripts/train_minerva_noctua_llama3b.sh`
-- `rlvr/cti-scripts/train_minerva_noctua_llama8b.sh`
-- `rlvr/cti-scripts/train_minerva_noctua_qwen4b.sh`
-- `rlvr/cti-scripts/train_minerva_noctua_qwen8b.sh`
-
-Example:
-
-```bash
-bash rlvr/cti-scripts/train_minerva_noctua_llama3b.sh
-```
-
-Key env overrides:
-- `ACRD_ACR_RL_WEIGHT` (scales the ACR PPO update)
-- `ACRD_ACR_ROLLOUT_N` (number of ACR samples per prompt; default 4)
-- `ACRD_ACR_DISTILL_INTERVAL` (set to 1 for per-step SFT)
-- `ACRD_ACR_DISTILL_THRESHOLD` (threshold applied to `acr_base_score` before r_correct scaling; default 0.5)
-- `ACRD_DEBUG_SAMPLES` (prints original prompt -> ACR prompt -> rollouts -> selected response; default 2)
-- `ACRD_DETAILS_DEBUG_SAMPLES` (prints details-missing/omitted locations; default 2)
-- `ACRD_MAX_DETAILS_CHARS`, `ACRD_ACR_MAX_PROMPT_LEN`
-- `ACRD_TOTAL_STEPS`, `ACRD_TRAIN_BATCH_SIZE`
-- `ACRD_EXPERIMENT_NAME` (defaults to `minerva_acrd_grpo_<model-slug>`)
-
----
-
-### 7) Optional offline pipeline
-The earlier offline ACR->SFT pipeline (collect traces -> build SFT parquet) is still available
-via `scripts/collect_acr_traces.py` and `scripts/build_sft_from_acr.py`, but the per-batch
-trainer flow is the preferred path for ACRD.
-
----
-
-### 8) Configs
-Use `configs/acr_rl.yaml` for standalone ACR-only runs, or rely on the archived per-batch
-overrides from `rlvr/old-cti-scripts/train_minerva_acrd.sh`.
-
-Standalone ACR example:
-
-```yaml
-data:
-  custom_cls:
-    path: rlvr/verl/utils/dataset/minerva_acr_dataset.py
-    name: ACRRLHFDataset
-  dataloader_num_workers: 0
-
-actor_rollout_ref:
-  rollout:
-    n: 1
-
-custom_reward_function:
-  path: rlvr/verl/utils/reward_score/reward_acr.py
-  name: reward_acr
-  reward_kwargs:
-    r_correct: 0.2
-    leak_penalty: 0.5
-    multilabel_match: exact
-    enforce_no_id_in_reasoning: true
-```
-
-Defaults:
-- `banned_phrases` is defined in `rlvr/verl/utils/reward_score/reward_acr.py` (answer/label variants).
-- `use_fuzzy_leak_check` is enabled by default.
-
-Per-batch ACRD needs:
-- `data.return_raw_chat=true`
-- `data.acr.per_batch=true` plus `data.acr.*` overrides (weight, rollout_n, distill interval)
-
----
-
-### 9) Validation / evaluation
-Use `scripts/eval_acr_outputs.py` to compute parse rate, leak-hit rate,
-ID leak rate, and mean score on a JSONL file with outputs + ground_truth.
-Supports `--multilabel-match` and `--enforce-no-id`.
-
----
-
-## Implementation notes / gotchas
-- Keep ACR reward small. It is a format/compliance shaper, not a second task objective.
-- Keep the final answer on the last line, using the same format as the original task.
-- Keep label details short. Do not blow up prompt length.
-- Per-step SFT (`interval=1`) keeps the same batch for RLVR->ACR->SFT.
-- Distill eligibility uses `acr_base_score` (pre-scaling); selection uses weighted reward and mean-NLL tie-break.
-- `ACRD_DEBUG_SAMPLES` prints original prompt -> ACR prompt -> rollouts -> selected response for quick inspection.
-- `acr/details_missing`, `acr/details_omitted`, `acr/details_truncated` metrics track label-detail coverage.
-- `acr/details_not_applicable` counts samples where no label details are expected (e.g., CVSS).
-
-## Practical recommendations
-- Treat Step 2 as a trace generator + filter, not a direct accuracy booster.
-- Tighten the output contract (final answer line only).
-- Run SFT frequently enough to internalize traces, but not so frequently that RLVR stops exploring.
+Paper ablation launchers and older ACRD/LHC experiments remain under `rlvr/old-cti-scripts/`. The older `configs/acr_rl.yaml`, `configs/acrd_pipeline.yaml`, and offline ACR scripts describe separate experimental workflows; they are not the supported MinervaRL launch configuration above.

@@ -8,7 +8,7 @@ import re
 from typing import Any, Optional
 
 from minerva.analysis import retrieval_candidates
-from minerva.retrieval import task_specs as retrieval_task_specs
+from minerva import label_specs
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ TASK_SPECS: dict[str, CTITaskSpec] = {
         label_id_regex=spec.label_id_regex,
         task_key=None,
     )
-    for key, spec in retrieval_task_specs.TASK_SPECS.items()
+    for key, spec in label_specs.TASK_SPECS.items()
 }
 
 # Task-name aliases seen in Minerva JSONL rows.
@@ -86,7 +86,7 @@ def get_task_spec(
         label_type = spec.get("label_type")
         gold_key = str(spec.get("gold_key") or "")
         is_multilabel = gold_key.endswith("ids")
-        regex = retrieval_task_specs.regex_for_label_type(label_type)
+        regex = label_specs.regex_for_label_type(label_type)
         return CTITaskSpec(
             entity_type=label_type,
             is_multilabel=is_multilabel,
@@ -99,7 +99,7 @@ def get_task_spec(
     if direct is not None:
         return direct
 
-    fallback = retrieval_task_specs.get_task_spec(data_source, ground_truth)
+    fallback = label_specs.get_task_spec(data_source, ground_truth)
     return CTITaskSpec(
         entity_type=fallback.label_type,
         is_multilabel=fallback.is_multilabel,

@@ -1,102 +1,67 @@
-# Minerva Dataset Preparation
+# Minerva-CTI dataset preparation
 
-This document describes the full dataset preparation pipeline for Minerva, suitable for inclusion in a research methods section. It covers data sources, task construction, resampling, train/validation splitting, LHC augmentation, retrieval artifacts, and conversion to RL-ready formats.
+Minerva-CTI is the dataset in [the Minerva paper](https://openreview.net/forum?id=w1IMu9exKC): **32,000 training examples and 1,200 validation examples across 16 tasks**. The checked-in runtime files are `dataset/minerva_base_split/minerva-base-{train,dev}.jsonl` and the corresponding parquet files in `rlvr/mydata/minerva_base/`.
 
-## Overview
-Minerva builds RL-friendly cyber threat intelligence datasets from public CTI sources. The pipeline produces:
-- Base datasets (`dataset/minerva_base/*.jsonl` + metadata)
-- LHC datasets with retrieval candidate pools (`dataset/minerva_lhc/*.jsonl` + metadata)
-- Train/dev splits in minimal schema (`dataset/minerva_base_split/` and `dataset/minerva_lhc_split/`)
-- RLVR-ready Parquet and Excel outputs (`rlvr/mydata/minerva_base/`, `rlvr/mydata/minerva_lhc/`)
+## Sources and raw caches
 
-All paths and task parameters are configured through `minerva/config.yaml` and cached source files under `dataset/`.
+The builder uses public CTI sources: NVD CVEs, MITRE ATT&CK, CAPEC, CWE, mappings-explorer, Sigma, Atomic Red Team, Microsoft Sentinel, and Splunk Security Content. Input paths and task options are configured in [`minerva/config.yaml`](../minerva/config.yaml).
 
-## Data sources and caching
-Inputs are fetched once and cached locally:
-- NVD CVE records: `dataset/nvd/`
-- MITRE ATT&CK bundle: `dataset/mitre/enterprise-attack.json`
-- CAPEC bundle: `dataset/capec/stix-capec.json`
-- Sigma rules: `dataset/sigma/`
-- Mappings-explorer CVE->ATT&CK mappings: `dataset/mappings-explorer/`
+Restore or regenerate the raw caches before rebuilding: `dataset/nvd/`, `dataset/mitre/`, `dataset/capec/`, `dataset/cwe/`, `dataset/mappings-explorer/`, `dataset/sigma/`, and `dataset/detection/`. The curated repository includes final runtime assets, not all raw inputs. `NVD_API_KEY` is optional and helps with NVD rate limits.
 
-Network fetches are rate-limited; use `NVD_API_KEY` to avoid strict NVD throttling.
+## Task counts
 
-## Task construction
-The pipeline generates per-task JSONL files with standardized `task`, `input`, `ground_truth`, and `reward_fn` fields. Tasks include:
-- CVE -> ATT&CK exploitation / primary impact / secondary impact
-- Sigma -> ATT&CK technique / tactics
-- Scenario -> technique / tactics / mitigations
-- CVE -> CWE
-- CVE -> CVSS v3.1 / v4.0
-- CAPEC example -> CAPEC / CWE / ATT&CK
-- Threat actor MCQ
+These counts match the checked-in JSONL splits and the current targets in [`minerva/split.py`](../minerva/split.py). Names below are the builder's task keys; scenario rows use the corresponding `scenario_to_attack_*` aliases.
 
-Generation uses deterministic seeds where applicable; prompt text is embedded in each row.
+| Task | Train | Validation |
+| --- | ---: | ---: |
+| `cve_to_attack_exploitation` | 245 | 20 |
+| `cve_to_attack_primary_impact` | 210 | 20 |
+| `cve_to_attack_secondary_impact` | 64 | 10 |
+| `sigma_to_attack_technique` | 950 | 50 |
+| `sigma_to_attack_tactics` | 950 | 50 |
+| `art_to_attack_technique` | 950 | 50 |
+| `sentinel_to_attack_technique` | 950 | 50 |
+| `splunk_to_attack_technique` | 280 | 20 |
+| `scenario_to_technique` | 7,780 | 220 |
+| `scenario_to_tactics` | 1,950 | 50 |
+| `scenario_to_mitigations` | 7,780 | 220 |
+| `cve_to_cwe` | 6,696 | 220 |
+| `cve_to_cvss_v31` | 1,900 | 100 |
+| `threat_actor` | 779 | 60 |
+| `capec_example_to_capec` | 340 | 40 |
+| `capec_example_to_cwe` | 176 | 20 |
+| **Total** | **32,000** | **1,200** |
 
-## Resampling policy (fixed per-task totals)
-After task generation, each per-task JSONL is resampled to a fixed target size using a seeded reservoir sampler (seed 1337). This yields a total of 33,000 examples across tasks.
+The pipeline resamples to fixed per-task totals with seed 1337. The split step reserves the configured validation count for each task and assigns the remainder to training. Source-cache versions affect a fresh rebuild; use the checked-in runtime files for the released split.
 
-| Task | Train samples | Validation samples | Total samples |
-| --- | --- | --- |
-| cve_to_attack_exploitation | 245 | 20 | 265 |
-| cve_to_attack_primary_impact | 210 | 20 | 230 |
-| cve_to_attack_secondary_impact | 54 | 20 | 74 |
-| sigma_to_attack_technique | 950 | 50 | 1000 |
-| sigma_to_attack_tactics | 950 | 50 | 1000 |
-| scenario_to_technique | 7350 | 150 | 7500 |
-| scenario_to_tactics | 950 | 50 | 1000 |
-| scenario_to_mitigations | 7340 | 160 | 7500 |
-| cve_to_cwe | 7800 | 200 | 8000 |
-| cve_to_cvss_v31 | 1900 | 100 | 2000 |
-| cve_to_cvss_v40 | 480 | 20 | 500 |
-| capec_example_to_capec | 360 | 20 | 380 |
-| capec_example_to_cwe | 176 | 20 | 196 |
-| capec_example_to_attack | 124 | 20 | 144 |
-| threat_actor_mcq | 3111 | 100 | 3211 |
-| **Total** | **32000** | **1000** | **33000** |
+CVSS v4.0 and CAPEC-to-ATT&CK builders are retained as optional utilities but have zero target samples in the released configuration. Legacy LHC candidate-pool augmentation is separate from the Minerva-CTI split used by MinervaRL.
 
-## Train/validation split policy
-Splits are produced by sampling the per-task totals above, shuffling with a fixed RNG seed (1337), and assigning a fixed number of validation rows per task (table above). The remainder of each task is assigned to training. This yields exactly 32,000 training rows and 1,000 validation rows. No cross-task balancing is applied after the per-task split.
+## Rebuild and convert
 
-Split outputs:
-- Base: `dataset/minerva_base_split/minerva-base-train.jsonl`, `minerva-base-dev.jsonl`
-- LHC: `dataset/minerva_lhc_split/minerva-lhc-train.jsonl`, `minerva-lhc-dev.jsonl`
-
-## LHC augmentation (candidate pools)
-The LHC dataset augments each base example with a `candidate_pool_top100` list using task-specific retrieval strategies. Candidate pools are computed with a combination of BM25 and dense retrieval using the retrieval selection spec at `minerva/analysis/retrieval_selection/retrieval_selection.json`.
-
-## Retrieval artifacts
-For TARBA and retrieval-enabled training/evaluation, canonical label documents and BM25 indexes are built into:
-- `dataset/retrieval/label_docs/`
-- `dataset/retrieval/index/`
-
-These artifacts are generated from the cached MITRE/CAPEC/CWE sources.
-
-## RLVR conversion
-Split JSONLs are converted to VeRL-ready Parquet and Excel files using `rlvr/mydata/data_prepare/cti.py`. The conversion injects CTI system prompts and preserves the per-row `reward_fn` as the data source for Minerva datasets.
-
-Outputs:
-- `rlvr/mydata/minerva_base/*.parquet` and `.xlsx`
-- `rlvr/mydata/minerva_lhc/*.parquet` and `.xlsx`
-
-## Reproducible command sequence
-The following sequence rebuilds all artifacts end-to-end:
+After completing the [repository setup](../README.md#first-setup) and restoring the raw caches, run from the repository root:
 
 ```bash
-# Base + LHC datasets (includes resampling)
-python -m minerva.pipeline --config minerva/config.yaml --variant base --output-root dataset/minerva_base
-python -m minerva.pipeline --config minerva/config.yaml --variant lhc --output-root dataset/minerva_base --lhc-output-root dataset/minerva_lhc
+source .venv/bin/activate
 
-# Splits (fixed per-task validation counts)
-python -m minerva.split --input-dir dataset/minerva_base --output-dir dataset/minerva_base_split --file-prefix minerva-base
-python -m minerva.split --input-dir dataset/minerva_lhc --output-dir dataset/minerva_lhc_split --file-prefix minerva-lhc --reuse-split dataset/minerva_base_split
-python -m minerva.split --input-dir dataset/minerva_base --output-dir dataset/minerva_split
+python -m minerva.pipeline \
+  --config minerva/config.yaml \
+  --variant base \
+  --output-root dataset/minerva_base
 
-# Retrieval artifacts
-python -m minerva.retrieval.build_label_docs --config configs/retrieval/label_docs.yaml --out_dir dataset/retrieval/label_docs
-python -m minerva.retrieval.build_index --label_docs_dir dataset/retrieval/label_docs --out_dir dataset/retrieval/index
+python -m minerva.split \
+  --input-dir dataset/minerva_base \
+  --output-dir dataset/minerva_base_split \
+  --file-prefix minerva-base
 
-# RLVR conversion
-python rlvr/mydata/data_prepare/cti.py --data_dir dataset/minerva_base_split --out_dir rlvr/mydata/minerva_base
-python rlvr/mydata/data_prepare/cti.py --data_dir dataset/minerva_lhc_split --out_dir rlvr/mydata/minerva_lhc
+python -m scripts.build_label_details
+
+python rlvr/mydata/data_prepare/cti.py \
+  --data_dir dataset/minerva_base_split \
+  --out_dir rlvr/mydata/minerva_base
 ```
+
+The conversion preserves task-specific rewards and prepares the CTI prompts for VeRL. Label-detail construction writes the canonical reference store under `dataset/label_details/`, which the MinervaRL teacher uses during ACR generation. It does not require the removed TARBA retrieval service.
+
+The AthenaBench-Mini validation parquets are already in `rlvr/mydata/athena/`. They contain 950 examples across six tasks, including 50 TAA examples. The [method guide](acrd.md#baselines-and-evaluation) explains their use for validation and overlap with final evaluation tasks.
+
+See [task descriptions](task-descriptions.md) and the [dataset package guide](../minerva/README.md) for source and prompt details.

@@ -15,7 +15,7 @@ from typing import Dict, Iterable, List
 
 from minerva.analysis import retrieval_candidates
 from minerva.data_sources import mitre as mitre_source
-from minerva.retrieval.task_specs import normalize_label
+from minerva.label_specs import normalize_label
 
 
 _TECH_ID_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b", re.IGNORECASE)
