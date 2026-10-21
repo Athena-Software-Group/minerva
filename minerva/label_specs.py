@@ -1,4 +1,4 @@
-"""Task specs and label helpers for TARBA retrieval."""
+"""Shared CTI label metadata and normalization for MinervaRL."""
 
 from __future__ import annotations
 

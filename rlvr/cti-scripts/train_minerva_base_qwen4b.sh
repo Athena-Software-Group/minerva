@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-# Training script for Minerva Base GRPO (no TARBA) with Qwen3 4B.
+# Training script for plain GRPO on Minerva-CTI with Qwen3 4B.
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$ROOT_DIR/mydata"

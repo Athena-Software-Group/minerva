@@ -1,6 +1,6 @@
 # Task Definitions and Prompts
 
-Structured reference for how each dataset is built, the inputs/outputs, reward used, and the exact prompt. Train/dev counts come from `dataset/minerva_split/`.
+Structured reference for how each dataset is built, the inputs/outputs, reward used, and the exact prompt. The released 16-task split is in `dataset/minerva_base_split/`; see [dataset preparation](dataset.md) for the 32,000/1,200 train/dev counts. This reference also describes optional legacy builders outside that split.
 
 ---
 

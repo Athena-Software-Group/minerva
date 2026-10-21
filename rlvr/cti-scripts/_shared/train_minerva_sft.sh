@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Pure SFT training script for the fixed DART-style Minerva SFT dataset.
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_DIR="$ROOT_DIR/mydata"
 REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
 export PYTHONPATH="$ROOT_DIR:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

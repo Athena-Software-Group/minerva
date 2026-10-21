@@ -1588,8 +1588,8 @@ class RayPPOTrainer:
             from minerva.acr_prompt import dedupe_labels, extract_gold_labels, try_build_acr_messages
             from minerva.cti_task_specs import get_task_spec
             from minerva.label_details_store import LabelDetailsStore
-            from minerva.retrieval.task_specs import TaskSpec as RetrievalTaskSpec
-            from minerva.retrieval.task_specs import extract_labels_from_truth, normalize_label
+            from minerva.label_specs import TaskSpec as LabelSpec
+            from minerva.label_specs import extract_labels_from_truth, normalize_label
         except Exception as exc:
             print(f"ACR per-batch disabled: {exc}")
             return
@@ -1652,7 +1652,7 @@ class RayPPOTrainer:
         self._acr_get_task_spec = get_task_spec
         self._acr_normalize_label = normalize_label
         self._acr_extract_labels_from_truth = extract_labels_from_truth
-        self._acr_task_spec_cls = RetrievalTaskSpec
+        self._acr_task_spec_cls = LabelSpec
         self._acr_task_reasoning_hints = apply_reasoning_hints(
             DEFAULT_TASK_REASONING_HINTS, acr_cfg.get("task_reasoning_hints")
         )

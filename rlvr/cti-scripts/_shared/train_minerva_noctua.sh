@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ACRD per-batch training: RLVR -> ACR generation -> distill (SFT or DPO).
+# MinervaRL shared launcher: GRPO -> deferred ACR generation -> original-prompt distillation.
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA_DIR="$ROOT_DIR/mydata"
 REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
 export PYTHONPATH="$ROOT_DIR:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

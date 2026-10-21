@@ -12,8 +12,8 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from minerva.acr_prompt import dedupe_labels, extract_gold_labels, try_build_acr_messages
 from minerva.cti_task_specs import get_task_spec
 from minerva.label_details_store import LabelDetailsStore
-from minerva.retrieval.task_specs import TaskSpec as RetrievalTaskSpec
-from minerva.retrieval.task_specs import extract_labels_from_truth, normalize_label
+from minerva.label_specs import TaskSpec as LabelSpec
+from minerva.label_specs import extract_labels_from_truth, normalize_label
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
@@ -143,7 +143,7 @@ class ACRRLHFDataset(RLHFDataset):
 
         gold_norm: List[str] = []
         try:
-            retrieval_spec = RetrievalTaskSpec(
+            retrieval_spec = LabelSpec(
                 label_type=entity_type,
                 is_multilabel=bool(spec.is_multilabel),
                 label_id_regex=spec.label_id_regex,
@@ -192,7 +192,7 @@ class ACRRLHFDataset(RLHFDataset):
                         break
             if option_text:
                 try:
-                    retrieval_spec = RetrievalTaskSpec(
+                    retrieval_spec = LabelSpec(
                         label_type=entity_type,
                         is_multilabel=bool(spec.is_multilabel),
                         label_id_regex=spec.label_id_regex,

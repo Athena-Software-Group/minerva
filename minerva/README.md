@@ -1,23 +1,24 @@
-# Minerva Dataset Pipeline
+# Minerva-CTI dataset pipeline
 
-Builds RL-friendly CTI datasets from public sources (NVD CVEs, CAPEC, MITRE ATT&CK procedures, Sigma rules, mappings-explorer).
+This package constructs Minerva-CTI, the dataset used by MinervaRL in [the paper](https://openreview.net/forum?id=w1IMu9exKC). The training method is implemented in [`rlvr/`](../rlvr/); see the [MinervaRL guide](../docs/acrd.md).
 
-## What gets built
-- CVE → CWE, CVE → CVSS v3.1, CVE → CVSS v4.0
-- CVE → ATT&CK exploitation/impact (mappings-explorer)
-- Sigma → ATT&CK technique/tactics
-- Procedure scenarios → ATT&CK technique/tactics/mitigations/detections
-- CAPEC examples → CAPEC ID / CWE IDs / ATT&CK technique
-- Threat actor MCQ from procedure descriptions
+## Released dataset
 
-Outputs are JSONL files under `dataset/minerva/` with `dataset/minerva/metadata.json` for counts/examples. Train/dev splits (32k/8k) live under `dataset/minerva_split/` with minimal fields (`task`, `prompt`, `ground_truth`, `reward_fn`).
+The released split has **32,000 training examples and 1,200 validation examples across 16 tasks**, covering CVE-to-ATT&CK mappings, Sigma/Atomic Red Team/Sentinel/Splunk technique mappings, scenario-to-technique/tactic/mitigation mappings, CVE-to-CWE and CVSS v3.1, threat-actor attribution, and CAPEC example-to-CAPEC/CWE mappings.
+
+Builder outputs live under `dataset/minerva_base/`; the checked-in JSONL splits are in `dataset/minerva_base_split/`, and training parquets are in `rlvr/mydata/minerva_base/`. See [dataset preparation](../docs/dataset.md) for the per-task counts and raw-cache requirements.
 
 ## Run it
+
+Use the [root setup instructions](../README.md#first-setup), restore the required source caches, then run:
+
+```bash
+source .venv/bin/activate
+python -m minerva.pipeline --config minerva/config.yaml --variant base --output-root dataset/minerva_base
+python -m minerva.split --input-dir dataset/minerva_base --output-dir dataset/minerva_base_split --file-prefix minerva-base
 ```
-.venv\Scripts\python -m pip install -r requirements.txt
-$env:NVD_API_KEY="..."   # optional, for NVD rate limits
-.venv\Scripts\python -m minerva.pipeline --config minerva/config.yaml
-```
+
+The prompt reference below also includes optional legacy builders (CVSS v4.0, detection strategies, and CAPEC-to-ATT&CK) that are outside the released 16-task split.
 
 ## Prompt references
 
